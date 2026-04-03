@@ -1,0 +1,211 @@
+module TokenizationTest where
+
+import Daml.Script
+
+import DA.Assert ((===), assert, assertMsg)
+import DA.Date (date, Month(..))
+import DA.Time (time)
+import DA.Either (isLeft)
+import DA.Optional (fromSomeNote)
+import DA.List (head)
+
+-- Project module imports
+import SecurityToken
+import Whitelist
+import Dividend
+import CorporateAction
+
+-- | A full end-to-end test of the asset tokenization lifecycle.
+-- This script covers:
+-- 1. Whitelist creation and investor onboarding.
+-- 2. Security token issuance.
+-- 3. Primary distribution of tokens to whitelisted investors.
+-- 4. A successful secondary transfer between two whitelisted investors.
+-- 5. A failed secondary transfer attempt to a non-whitelisted party.
+-- 6. Dividend declaration and distribution.
+-- 7. A corporate action proposal and voting process.
+tokenizationLifecycleTests : Script ()
+tokenizationLifecycleTests = script do
+  -- === 0. SETUP: Allocate parties ===
+  issuer <- allocateParty "Issuer"
+  regulator <- allocateParty "Regulator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie" -- Intentionally not whitelisted
+
+  debug "Parties allocated."
+
+  -- === 1. WHITELIST: Setup and Onboarding ===
+  debug "Setting up whitelist..."
+  whitelistProposalCid <- submit issuer do
+    createCmd WhitelistProposal with
+      issuer
+      regulator
+
+  whitelistCid <- submit regulator do
+    exerciseCmd whitelistProposalCid AcceptWhitelist
+
+  debug $ "Whitelist created: " <> show whitelistCid
+
+  -- Onboard Alice and Bob
+  _ <- submit regulator do exerciseCmd whitelistCid AddToWhitelist with partyToAdd = alice
+  _ <- submit regulator do exerciseCmd whitelistCid AddToWhitelist with partyToAdd = bob
+
+  whitelistContract <- fetch whitelistCid
+  whitelistContract.approvedParties === [bob, alice] -- Note: order is LIFO
+  debug "Alice and Bob have been whitelisted."
+
+  -- === 2. TOKEN ISSUANCE: Create the Security Token ===
+  debug "Issuing security token..."
+  let
+    issueDate = date 2024 Jan 1
+    assetDescription = "Tokenized Real Estate Fund Series A"
+    totalQuantity = 10000.0
+    assetId = "TREF-SERIES-A"
+
+  tokenCid <- submit issuer do
+    createCmd SecurityToken with
+      issuer
+      regulator
+      id = assetId
+      description = assetDescription
+      totalQuantity
+      issueDate
+      whitelistCid
+
+  debug $ "SecurityToken created: " <> show tokenCid
+
+  -- === 3. PRIMARY DISTRIBUTION: Mint and Distribute Tokens ===
+  debug "Distributing tokens to initial investors..."
+  (aliceHoldingCid, bobHoldingCid) <- submit issuer do
+    (,)
+      <$> exerciseCmd tokenCid MintAndDistribute with recipient = alice, quantity = 7500.0
+      <*> exerciseCmd tokenCid MintAndDistribute with recipient = bob, quantity = 2500.0
+
+  -- Verify initial holdings
+  aliceHolding <- fetch aliceHoldingCid
+  aliceHolding.owner === alice
+  aliceHolding.quantity === 7500.0
+
+  bobHolding <- fetch bobHoldingCid
+  bobHolding.owner === bob
+  bobHolding.quantity === 2500.0
+  debug "Initial token distribution complete. Alice has 7500, Bob has 2500."
+
+  -- === 4. SECONDARY TRANSFER: Successful Transfer ===
+  debug "Testing successful secondary transfer from Alice to Bob..."
+  -- Alice transfers 1000 units to Bob
+  transferProposalCid <- submit alice do
+    exerciseCmd aliceHoldingCid ProposeTransfer with
+      newOwner = bob
+      transferQuantity = 1000.0
+
+  (newAliceHoldingCid, newBobHoldingCid) <- submit bob do
+    exerciseCmd transferProposalCid AcceptTransfer
+
+  -- Verify new holding balances
+  newAliceHolding <- fetch newAliceHoldingCid
+  newAliceHolding.quantity === 6500.0 -- 7500 - 1000
+
+  newBobHolding <- fetch newBobHoldingCid
+  newBobHolding.quantity === 3500.0 -- 2500 + 1000
+  debug "Transfer successful. Alice now has 6500, Bob has 3500."
+
+  -- === 5. SECONDARY TRANSFER: Failed Transfer (Not Whitelisted) ===
+  debug "Testing failed transfer to non-whitelisted party Charlie..."
+  transferToCharlieRes <- submitTry bob do
+    exerciseCmd newBobHoldingCid ProposeTransfer with
+      newOwner = charlie
+      transferQuantity = 500.0
+
+  assert (isLeft transferToCharlieRes)
+  debug "Transfer attempt to Charlie correctly failed as he is not whitelisted."
+
+
+  -- === 6. DIVIDEND: Declare and Distribute ===
+  debug "Testing dividend distribution..."
+  let
+    recordDate = date 2024 Mar 15
+    paymentDate = date 2024 Apr 1
+    dividendPerShare = 0.10 -- $0.10 per token
+
+  -- Issuer proposes the dividend
+  dividendProposalCid <- submit issuer do
+    exerciseCmd tokenCid ProposeDividend with
+      recordDate
+      paymentDate
+      dividendPerShare
+
+  -- Issuer distributes the dividend payments
+  -- The DistributeDividend choice will discover all TokenHolding contracts and create payments
+  (alicePaymentCid, bobPaymentCid) <- submit issuer do
+    exerciseCmd dividendProposalCid DistributeDividend
+
+  -- Verify dividend payments
+  alicePayment <- fetch alicePaymentCid
+  alicePayment.investor === alice
+  alicePayment.paymentAmount === 650.0 -- 6500 * 0.10
+
+  bobPayment <- fetch bobPaymentCid
+  bobPayment.investor === bob
+  bobPayment.paymentAmount === 350.0 -- 3500 * 0.10
+  debug "Dividend distribution successful."
+
+
+  -- === 7. CORPORATE ACTION: Propose and Vote ===
+  debug "Testing corporate action: a board member vote..."
+  let
+    actionDetails = "Vote on appointing new board member 'Daniel Larimer'"
+    votingDeadline = time (date 2024 May 1) 0 0 0
+
+  -- Issuer proposes the action
+  actionProposalCid <- submit issuer do
+    createCmd CorporateActionProposal with
+      issuer
+      tokenCid
+      details = actionDetails
+      votingDeadline
+
+  -- Holders cast their votes.
+  -- Alice votes in favor (True)
+  _ <- submit alice do
+    exerciseCmd actionProposalCid CastVote with vote = True
+
+  -- Bob votes against (False)
+  _ <- submit bob do
+    exerciseCmd actionProposalCid CastVote with vote = False
+
+  -- Verify votes were cast
+  actionProposal <- fetch actionProposalCid
+  actionProposal.votesCast === [bob, alice]
+  -- In a real scenario, weights would be attached. This test verifies participation.
+  debug "Alice and Bob have cast their votes on the corporate action."
+
+  -- Issuer processes the result.
+  -- Let's say based on a 2/3 majority weighted by holdings, the action passes.
+  actionResultCid <- submit issuer do
+    exerciseCmd actionProposalCid ProcessVoteResult with passed = True
+
+  actionResult <- fetch actionResultCid
+  actionResult.details === actionDetails
+  actionResult.passed === True
+  debug "Corporate action vote processed and result recorded."
+
+
+  -- === 8. FINAL STATE VALIDATION ===
+  debug "Performing final state validation..."
+  -- Query for active holdings
+  aliceHoldings <- query @TokenHolding alice
+  (aliceCid, aliceContract) <- return $ fromSomeNote "Alice holding not found" $ head aliceHoldings
+  aliceContract.quantity === 6500.0
+
+  bobHoldings <- query @TokenHolding bob
+  (bobCid, bobContract) <- return $ fromSomeNote "Bob holding not found" $ head bobHoldings
+  bobContract.quantity === 3500.0
+
+  -- Ensure charlie has no holdings
+  charlieHoldings <- query @TokenHolding charlie
+  length charlieHoldings === 0
+
+  debug "Final state of token holdings is correct."
+  debug "Tokenization lifecycle test completed successfully."
