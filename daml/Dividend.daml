@@ -1,0 +1,139 @@
+module Dividend where
+
+import DA.Date
+import DA.Time
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Map (Map)
+import qualified DA.Map as Map
+import DA.Numeric
+
+-- Assuming SecurityToken.daml provides these templates/types
+import SecurityToken (Token, Holding)
+
+-- | Proposal from the token issuer to initiate a dividend distribution.
+-- | This contract is the first step in the dividend lifecycle.
+template DividendProposal
+  with
+    issuer: Party
+      -- ^ The party issuing the security token and proposing the dividend.
+    regulator: Party
+      -- ^ A regulatory body observing the process.
+    tokenCid: ContractId Token
+      -- ^ The contract ID of the security token for which the dividend is being issued.
+    exDividendDate: Date
+      -- ^ The date on which a holder must own the token to be eligible for the dividend.
+    paymentDate: Date
+      -- ^ The date on which the dividend payment will be made.
+    dividendAmountPerUnit: Numeric 10
+      -- ^ The cash amount to be paid per unit of the token (e.g., per share).
+  where
+    signatory issuer
+    observer regulator
+
+    ensure exDividendDate < paymentDate && dividendAmountPerUnit > 0.0
+
+    -- | The issuer accepts the proposal, locking in the shareholder list and creating
+    -- | the main distribution contract to manage payouts.
+    choice AcceptDividendProposal : ContractId DividendDistribution
+      with
+        -- A snapshot of holdings is provided to ensure the distribution is based on a fixed
+        -- set of shareholders as of the acceptance time (ideally on the ex-dividend date).
+        holdingsSnapshot: Map Party Decimal
+      controller issuer
+      do
+        token <- fetch tokenCid
+        assertMsg "The issuer of the token must also be the issuer of the dividend." (token.issuer == issuer)
+        assertMsg "The provided holdings snapshot must match the token's current holdings." (token.holdings == holdingsSnapshot)
+
+        let eligibleHolders = Map.keysSet holdingsSnapshot
+        assertMsg "Cannot distribute a dividend when there are no eligible holders." (not $ Set.isempty eligibleHolders)
+
+        -- Calculate the total dividend amount to be paid out.
+        let totalDividendAmount = sum $ map (\(_, qty) -> qty * dividendAmountPerUnit) (Map.toList holdingsSnapshot)
+
+        create DividendDistribution with
+          issuer
+          regulator
+          tokenCid
+          exDividendDate
+          paymentDate
+          dividendAmountPerUnit
+          totalDividendAmount
+          pendingHolders = eligibleHolders
+          paidHolders = Map.empty
+
+-- | Manages the state of an active dividend distribution, tracking which holders
+-- | have been paid and which are still pending.
+template DividendDistribution
+  with
+    issuer: Party
+    regulator: Party
+    tokenCid: ContractId Token
+    exDividendDate: Date
+    paymentDate: Date
+    dividendAmountPerUnit: Numeric 10
+    totalDividendAmount: Numeric 10
+    pendingHolders: Set Party
+      -- ^ The set of token holders who are yet to receive their dividend payment.
+    paidHolders: Map Party (Numeric 10)
+      -- ^ A map of holders who have been paid and the amount they received.
+  where
+    signatory issuer
+    observer regulator, Set.toList pendingHolders
+
+    ensure not $ Set.isempty pendingHolders
+
+    -- | Records a payment to a specific holder. This transitions the contract state,
+    -- | either by updating the list of pending holders or by completing the distribution.
+    choice DistributeToHolder : Either (ContractId DividendDistribution) (ContractId DividendDistributionComplete)
+      with
+        holder: Party
+          -- ^ The party receiving the dividend payment.
+        holdingCid: ContractId Holding
+          -- ^ The specific holding contract for this holder, used to verify their entitlement.
+      controller issuer
+      do
+        assertMsg "The specified holder must be in the set of pending recipients." (Set.member holder pendingHolders)
+
+        holding <- fetch holdingCid
+        assertMsg "The holding contract must belong to the specified holder." (holding.owner == holder)
+        assertMsg "The holding contract must correspond to the correct security token." (holding.tokenCid == tokenCid)
+
+        let amountDue = holding.quantity * dividendAmountPerUnit
+
+        let newPendingHolders = Set.delete holder pendingHolders
+        let newPaidHolders = Map.insert holder amountDue paidHolders
+
+        if Set.isempty newPendingHolders then do
+          -- Last holder has been paid. Archive this contract and create the completion record.
+          completionCid <- create DividendDistributionComplete with
+            issuer
+            regulator
+            tokenCid
+            exDividendDate
+            paymentDate
+            totalAmountPaid = totalDividendAmount
+            finalPaidHolders = newPaidHolders
+          return $ Right completionCid
+        else do
+          -- More holders are pending. Re-create this contract with the updated state.
+          newDistCid <- create this with
+            pendingHolders = newPendingHolders
+            paidHolders = newPaidHolders
+          return $ Left newDistCid
+
+-- | An archival contract that serves as a final, immutable record of a completed
+-- | dividend distribution event.
+template DividendDistributionComplete
+  with
+    issuer: Party
+    regulator: Party
+    tokenCid: ContractId Token
+    exDividendDate: Date
+    paymentDate: Date
+    totalAmountPaid: Numeric 10
+    finalPaidHolders: Map Party (Numeric 10)
+  where
+    signatory issuer
+    observer regulator
