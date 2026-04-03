@@ -1,0 +1,150 @@
+module SecurityToken where
+
+import DA.Set qualified as Set
+import DA.Next.Total (Total, from_int, to_int, (+), (-), (>), (<=))
+import DA.Assert ((===))
+
+-- | Defines the rules governing a specific class of security tokens.
+-- This contract is created by the issuer and acts as a central point for
+-- managing transfer restrictions and other token properties.
+template TokenizationRule
+  with
+    issuer: Party
+      -- ^ The entity that issued the security token and sets the rules.
+    assetId: Text
+      -- ^ A unique identifier for the underlying asset (e.g., "ISIN-US0378331005", "REALESTATE-NYC-001").
+    description: Text
+      -- ^ A human-readable description of the asset.
+    transferWhitelist: Set.Set Party
+      -- ^ The set of parties authorized to hold and receive this token.
+  where
+    signatory issuer
+
+    key (issuer, assetId) : (Party, Text)
+    maintainer key._1
+
+    -- | Allows the issuer to modify the transfer whitelist.
+    choice UpdateWhitelist : ContractId TokenizationRule
+      with
+        newWhitelist: Set.Set Party
+          -- ^ The complete new set of whitelisted parties.
+      controller issuer
+      do
+        create this with transferWhitelist = newWhitelist
+
+-- | Represents a holding of a security token by an owner.
+-- Each contract instance signifies a specific quantity of a tokenized asset
+-- held by a party. Transfers are handled via a proposal-acceptance workflow.
+template Token
+  with
+    issuer: Party
+      -- ^ The issuer of the token, as defined in the `TokenizationRule`.
+    owner: Party
+      -- ^ The current legal owner of this quantity of the token.
+    ruleCid: ContractId TokenizationRule
+      -- ^ A reference to the rules governing this token.
+    assetId: Text
+      -- ^ The identifier of the asset this token represents.
+    quantity: Total
+      -- ^ The amount of the asset held. Must be greater than zero.
+  where
+    signatory issuer, owner
+
+    ensure quantity > from_int 0
+
+    key (issuer, owner, assetId) : (Party, Party, Text)
+    maintainer key._1, key._2
+
+    -- | The owner can initiate a transfer by creating a `TransferProposal`.
+    -- This proposal must be accepted by the `newOwner` to complete the transfer.
+    choice Offer_Transfer : ContractId TransferProposal
+      with
+        newOwner : Party
+          -- ^ The party to whom the tokens are being offered.
+        transferQuantity : Total
+          -- ^ The quantity of tokens to be transferred.
+      controller owner
+      do
+        -- Ensure the owner is not trying to transfer to themselves.
+        assertMsg "Cannot transfer to self" (owner /= newOwner)
+
+        -- Ensure a positive quantity is being transferred, up to the total holding.
+        assertMsg "Transfer quantity must be positive" (transferQuantity > from_int 0)
+        assertMsg "Transfer quantity exceeds holding" (transferQuantity <= quantity)
+
+        -- Fetch the rules to verify the new owner is on the whitelist.
+        rule <- fetch ruleCid
+        rule.issuer === issuer
+        rule.assetId === assetId
+        assertMsg "New owner is not whitelisted for this asset"
+          (Set.member newOwner rule.transferWhitelist)
+
+        -- Create the proposal contract for the new owner to accept.
+        create TransferProposal with
+          tokenCid = self
+          currentOwner = owner
+          ..
+
+-- | A proposal to transfer a specific quantity of a token from one party to another.
+-- This contract represents the in-flight state of a transfer, awaiting acceptance
+-- from the recipient or cancellation by either party.
+template TransferProposal
+  with
+    tokenCid: ContractId Token
+      -- ^ The `Token` contract from which the quantity will be transferred.
+    issuer: Party
+      -- ^ The issuer of the token.
+    currentOwner: Party
+      -- ^ The party initiating the transfer.
+    newOwner: Party
+      -- ^ The party who must accept the transfer.
+    transferQuantity: Total
+      -- ^ The quantity of tokens proposed for transfer.
+  where
+    signatory currentOwner, newOwner
+    observer issuer
+
+    -- | The recipient of the offer accepts the transfer, atomically executing the
+    -- transfer of ownership. It handles splitting the original token holding if it's
+    -- a partial transfer and merges the received amount with any existing holding
+    -- of the same token by the new owner.
+    choice Accept_Transfer : ()
+      controller newOwner
+      do
+        -- Fetch the original token contract to be transferred.
+        originalToken <- fetch tokenCid
+
+        -- Verify the details of the token match the proposal.
+        originalToken.issuer === issuer
+        originalToken.owner === currentOwner
+        originalToken.quantity >= transferQuantity
+
+        -- Archive the proposal and the original token holding.
+        archive self
+        archive tokenCid
+
+        -- Create a new token for the current owner with the remaining balance, if any.
+        let remainingQuantity = originalToken.quantity - transferQuantity
+        when (remainingQuantity > from_int 0) do
+          create originalToken with quantity = remainingQuantity
+
+        -- Check if the new owner already has a holding for this asset.
+        mbExistingToken <- lookupByKey @Token (issuer, newOwner, originalToken.assetId)
+        case mbExistingToken of
+          -- If no existing holding, create a new one.
+          None ->
+            create originalToken with
+              owner = newOwner
+              quantity = transferQuantity
+          -- If a holding exists, archive it and create a new merged holding.
+          Some (existingCid, existingToken) -> do
+            archive existingCid
+            create existingToken with
+              quantity = existingToken.quantity + transferQuantity
+
+    -- | Allows either the sender or receiver to cancel the transfer proposal before
+    -- it is accepted.
+    choice Cancel_Transfer : ()
+      controller currentOwner, newOwner
+      do
+        archive self
