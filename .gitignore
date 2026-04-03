@@ -1,0 +1,11 @@
+.daml/
+.daml-ui/
+.bloop/
+*.dar
+daml.log
+dist/
+node_modules/
+.env
+.DS_Store
+target/
+bloop.settings.json
