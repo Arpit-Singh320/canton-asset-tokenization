@@ -1,0 +1,216 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module CorporateAction where
+
+import DA.Date (Date)
+import DA.Action
+import DA.Assert
+import DA.List (elem, forA_)
+import DA.Numeric (Numeric)
+import qualified DA.Numeric as N
+
+import SecurityToken (SecurityToken)
+import Whitelist (Whitelist)
+
+-- #############################################################################
+-- # Data Types
+-- #############################################################################
+
+-- | Details specific to a stock split corporate action.
+data StockSplitDetails = StockSplitDetails
+  with
+    splitRatioNumerator : Int
+      -- ^ The numerator of the split ratio (e.g., 2 in a 2-for-1 split).
+    splitRatioDenominator : Int
+      -- ^ The denominator of the split ratio (e.g., 1 in a 2-for-1 split).
+  deriving (Eq, Show)
+
+-- | Details specific to a merger corporate action.
+data MergerDetails = MergerDetails
+  with
+    acquiringIssuer : Party
+      -- ^ The issuer of the new security post-merger.
+    acquiringIsin : Text
+      -- ^ The ISIN of the new security.
+    conversionRatio : Numeric 10
+      -- ^ The number of new shares received for each old share (e.g., 0.5).
+  deriving (Eq, Show)
+
+-- | A sum type to encapsulate the details of different corporate action types.
+data ActionDetails =
+    Split StockSplitDetails
+  | Merge MergerDetails
+  deriving (Eq, Show)
+
+-- #############################################################################
+-- # Templates
+-- #############################################################################
+
+-- | A proposal for a corporate action, which must be approved by a regulator
+-- | before it can be executed.
+template CorporateActionProposal
+  with
+    issuer : Party
+      -- ^ The issuer of the security undergoing the corporate action.
+    regulator : Party
+      -- ^ The regulatory body that must approve the action.
+    isin : Text
+      -- ^ The ISIN of the security being affected.
+    actionDetails : ActionDetails
+      -- ^ The specific details of the action (split or merger).
+    effectiveDate : Date
+      -- ^ The date on which the action will take effect.
+    narration : Text
+      -- ^ A human-readable description of the corporate action.
+  where
+    signatory issuer
+    observer regulator
+
+    -- | Allows the regulator to reject the proposal, archiving it.
+    choice Reject : ()
+      with
+        reason : Text
+          -- ^ The reason for the rejection.
+      controller regulator
+      do
+        archive self
+
+    -- | Allows the regulator to approve the proposal, creating an agreement.
+    choice Approve : ContractId CorporateActionAgreement
+      controller regulator
+      do
+        create CorporateActionAgreement with ..
+
+-- | An approved corporate action that is ready for execution by the issuer.
+-- | This contract is created after a regulator approves a `CorporateActionProposal`.
+template CorporateActionAgreement
+  with
+    issuer : Party
+    regulator : Party
+    isin : Text
+    actionDetails : ActionDetails
+    effectiveDate : Date
+    narration : Text
+  where
+    signatory issuer, regulator
+
+    key (issuer, isin, effectiveDate) : (Party, Text, Date)
+    maintainer key._1
+
+    -- | Executes a stock split. Archives existing security tokens and creates
+    -- | new ones with the adjusted quantity based on the split ratio.
+    choice Execute_Stock_Split : ()
+      with
+        tokenCids : [ContractId SecurityToken]
+          -- ^ A list of token contracts to be processed in this action.
+      controller issuer
+      do
+        -- Ensure the action details are correct for this choice
+        details <- case actionDetails of
+          Split d -> pure d
+          _ -> abort ("Execute_Stock_Split can only be exercised for a 'Split' action, not '" <> show actionDetails <> "'.")
+
+        -- In a real implementation, one would check `getTime` against the effectiveDate.
+        -- For simplicity, we assume this check is performed off-ledger before submission.
+
+        -- Process each token contract
+        forA_ tokenCids \tokenCid -> do
+          token <- fetch tokenCid
+          assertMsg ("Token ISIN " <> token.isin <> " does not match action ISIN " <> isin) (token.isin == isin)
+          assertMsg ("Token issuer " <> show token.issuer <> " does not match action issuer " <> show issuer) (token.issuer == issuer)
+
+          -- Archive the old token
+          archive tokenCid
+
+          -- Calculate the new quantity
+          let newQuantity = token.quantity * N.fromInt details.splitRatioNumerator / N.fromInt details.splitRatioDenominator
+
+          -- Create the new, post-split token, preserving all other details.
+          create token with quantity = newQuantity
+
+        -- Archive the agreement to prevent re-execution
+        archive self
+
+    -- | Executes a merger. Archives existing security tokens and creates
+    -- | `MergerClaim` contracts for each holder to redeem their new shares
+    -- | from the acquiring issuer.
+    choice Execute_Merger : ()
+      with
+        tokenCids : [ContractId SecurityToken]
+          -- ^ A list of token contracts to be processed in this action.
+      controller issuer
+      do
+        details <- case actionDetails of
+          Merge d -> pure d
+          _ -> abort ("Execute_Merger can only be exercised for a 'Merge' action, not '" <> show actionDetails <> "'.")
+
+        forA_ tokenCids \tokenCid -> do
+          token <- fetch tokenCid
+          assertMsg ("Token ISIN " <> token.isin <> " does not match action ISIN " <> isin) (token.isin == isin)
+          assertMsg ("Token issuer " <> show token.issuer <> " does not match action issuer " <> show issuer) (token.issuer == issuer)
+
+          archive tokenCid
+
+          let newQuantity = token.quantity * details.conversionRatio
+
+          -- Create a claim for the new shares from the acquiring company
+          create MergerClaim with
+            originalOwner = token.owner
+            originalIssuer = issuer
+            originalQuantity = token.quantity
+            acquiringIssuer = details.acquiringIssuer
+            acquiringIsin = details.acquiringIsin
+            newQuantity = newQuantity
+            regulator
+
+        archive self
+
+-- | A claim representing a holder's right to receive new securities from an
+-- | acquiring company following a merger. This contract is created by the
+-- | `Execute_Merger` choice.
+template MergerClaim
+  with
+    originalOwner : Party
+      -- ^ The owner of the original shares.
+    originalIssuer : Party
+      -- ^ The issuer of the original, now-defunct, shares.
+    originalQuantity : Numeric 10
+      -- ^ The quantity of original shares held.
+    acquiringIssuer : Party
+      -- ^ The issuer of the new shares.
+    acquiringIsin : Text
+      -- ^ The ISIN of the new shares.
+    newQuantity : Numeric 10
+      -- ^ The quantity of new shares the owner is entitled to.
+    regulator : Party
+  where
+    signatory originalIssuer, acquiringIssuer
+    observer originalOwner, regulator
+
+    key (acquiringIssuer, acquiringIsin, originalOwner) : (Party, Text, Party)
+    maintainer key._1
+
+    -- | Allows the original owner to redeem their claim, receiving new security
+    -- | tokens from the acquiring issuer.
+    nonconsuming choice Redeem_Claim : ContractId SecurityToken
+      with
+        whitelistCid: ContractId Whitelist
+          -- ^ Proof that the owner is whitelisted for the new security.
+      controller originalOwner, acquiringIssuer
+      do
+        -- Verify the owner is on the whitelist for the new security
+        whitelist <- fetch whitelistCid
+        assertMsg "Whitelist must be issued by the acquiring issuer." (whitelist.issuer == acquiringIssuer)
+        assertMsg "Original owner is not on the whitelist for the new security." (elem originalOwner whitelist.allowedParties)
+
+        -- The acquiring issuer creates the new security token for the owner
+        create SecurityToken with
+          issuer = acquiringIssuer
+          owner = originalOwner
+          isin = acquiringIsin
+          quantity = newQuantity
+          description = "Issued via merger from " <> originalIssuer
+          observers = [] -- The acquiring issuer may define its own standard observers.
