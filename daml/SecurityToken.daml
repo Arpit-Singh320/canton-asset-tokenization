@@ -1,150 +1,156 @@
 module SecurityToken where
 
-import DA.Set qualified as Set
-import DA.Next.Total (Total, from_int, to_int, (+), (-), (>), (<=))
-import DA.Assert ((===))
+import DA.Next.Set (Set)
+import qualified DA.Next.Set as Set
+import DA.Assert ((assert, assertMsg))
 
--- | Defines the rules governing a specific class of security tokens.
--- This contract is created by the issuer and acts as a central point for
--- managing transfer restrictions and other token properties.
-template TokenizationRule
+-- | Represents the underlying real-world asset being tokenized, such as a building or a private fund.
+-- The issuer is the entity that created and manages the asset and its tokenization.
+template Asset
   with
-    issuer: Party
-      -- ^ The entity that issued the security token and sets the rules.
-    assetId: Text
-      -- ^ A unique identifier for the underlying asset (e.g., "ISIN-US0378331005", "REALESTATE-NYC-001").
-    description: Text
-      -- ^ A human-readable description of the asset.
-    transferWhitelist: Set.Set Party
-      -- ^ The set of parties authorized to hold and receive this token.
+    issuer : Party
+    assetId : Text
+    description : Text
+    assetType : Text -- e.g., "REAL_ESTATE", "PRIVATE_EQUITY", "FUND_UNITS"
+    approvedHolders : Set Party
   where
     signatory issuer
 
     key (issuer, assetId) : (Party, Text)
     maintainer key._1
 
-    -- | Allows the issuer to modify the transfer whitelist.
-    choice UpdateWhitelist : ContractId TokenizationRule
+    -- | The issuer can add a new party to the whitelist of approved holders.
+    -- | This is crucial for maintaining compliance with KYC/AML regulations.
+    choice AddApprovedHolder : ContractId Asset
       with
-        newWhitelist: Set.Set Party
-          -- ^ The complete new set of whitelisted parties.
+        newHolder : Party
       controller issuer
       do
-        create this with transferWhitelist = newWhitelist
+        assertMsg ("Holder " <> show newHolder <> " is already approved.") (not $ Set.member newHolder approvedHolders)
+        create this with approvedHolders = Set.insert newHolder this.approvedHolders
 
--- | Represents a holding of a security token by an owner.
--- Each contract instance signifies a specific quantity of a tokenized asset
--- held by a party. Transfers are handled via a proposal-acceptance workflow.
-template Token
+    -- | The issuer can remove a party from the whitelist.
+    choice RemoveApprovedHolder : ContractId Asset
+      with
+        holderToRemove : Party
+      controller issuer
+      do
+        assertMsg ("Holder " <> show holderToRemove <> " not found in approved list.") (Set.member holderToRemove approvedHolders)
+        create this with approvedHolders = Set.delete holderToRemove this.approvedHolders
+
+-- | Represents a holding of a specific security token, representing fractional
+-- | ownership of an underlying asset. The contract includes a lock mechanism
+-- | for regulatory freezes.
+template SecurityToken
   with
-    issuer: Party
-      -- ^ The issuer of the token, as defined in the `TokenizationRule`.
-    owner: Party
-      -- ^ The current legal owner of this quantity of the token.
-    ruleCid: ContractId TokenizationRule
-      -- ^ A reference to the rules governing this token.
-    assetId: Text
-      -- ^ The identifier of the asset this token represents.
-    quantity: Total
-      -- ^ The amount of the asset held. Must be greater than zero.
+    issuer : Party
+    owner : Party
+    assetCid : ContractId Asset
+    quantity : Decimal
+    isLocked : Bool -- If True, the token is frozen and cannot be transferred.
   where
     signatory issuer, owner
+    observer issuer -- Issuer maintains oversight of all tokens.
 
-    ensure quantity > from_int 0
+    key (issuer, owner, assetCid) : (Party, Party, ContractId Asset)
+    maintainer key._1
 
-    key (issuer, owner, assetId) : (Party, Party, Text)
-    maintainer key._1, key._2
+    -- Ensures the owner is on the approved list for the underlying asset.
+    ensure
+      do
+        asset <- fetch assetCid
+        assertMsg ("Owner " <> show owner <> " is not an approved holder for this asset.")
+          (Set.member owner asset.approvedHolders)
 
-    -- | The owner can initiate a transfer by creating a `TransferProposal`.
-    -- This proposal must be accepted by the `newOwner` to complete the transfer.
-    choice Offer_Transfer : ContractId TransferProposal
+    -- | Allows the owner to transfer a portion or all of their tokens to another approved holder.
+    -- | This action is blocked if the token holding is locked by the issuer.
+    choice Transfer : Optional (ContractId SecurityToken)
       with
         newOwner : Party
-          -- ^ The party to whom the tokens are being offered.
-        transferQuantity : Total
-          -- ^ The quantity of tokens to be transferred.
+        amountToTransfer : Decimal
       controller owner
       do
-        -- Ensure the owner is not trying to transfer to themselves.
-        assertMsg "Cannot transfer to self" (owner /= newOwner)
+        -- Regulatory lock check
+        assertMsg "Token is locked by the issuer and cannot be transferred." (not isLocked)
 
-        -- Ensure a positive quantity is being transferred, up to the total holding.
-        assertMsg "Transfer quantity must be positive" (transferQuantity > from_int 0)
-        assertMsg "Transfer quantity exceeds holding" (transferQuantity <= quantity)
+        -- Validation checks
+        assertMsg "Transfer amount must be positive." (amountToTransfer > 0.0)
+        assertMsg "Transfer amount cannot exceed current quantity." (amountToTransfer <= quantity)
+        assertMsg "Cannot transfer to self." (newOwner /= owner)
 
-        -- Fetch the rules to verify the new owner is on the whitelist.
-        rule <- fetch ruleCid
-        rule.issuer === issuer
-        rule.assetId === assetId
-        assertMsg "New owner is not whitelisted for this asset"
-          (Set.member newOwner rule.transferWhitelist)
+        -- Verify the new owner is on the approved list for this asset.
+        asset <- fetch assetCid
+        assertMsg ("New owner " <> show newOwner <> " is not an approved holder for this asset.")
+          (Set.member newOwner asset.approvedHolders)
 
-        -- Create the proposal contract for the new owner to accept.
-        create TransferProposal with
-          tokenCid = self
-          currentOwner = owner
-          ..
+        let remainingQuantity = quantity - amountToTransfer
 
--- | A proposal to transfer a specific quantity of a token from one party to another.
--- This contract represents the in-flight state of a transfer, awaiting acceptance
--- from the recipient or cancellation by either party.
-template TransferProposal
-  with
-    tokenCid: ContractId Token
-      -- ^ The `Token` contract from which the quantity will be transferred.
-    issuer: Party
-      -- ^ The issuer of the token.
-    currentOwner: Party
-      -- ^ The party initiating the transfer.
-    newOwner: Party
-      -- ^ The party who must accept the transfer.
-    transferQuantity: Total
-      -- ^ The quantity of tokens proposed for transfer.
-  where
-    signatory currentOwner, newOwner
-    observer issuer
+        -- If part of the holding is transferred, create a new contract for the remainder.
+        -- Otherwise, the original contract is implicitly consumed by creating the new one.
+        if remainingQuantity > 0.0
+        then do
+          create this with quantity = remainingQuantity
+          -- Create a new token holding for the new owner.
+          -- This might fail on key collision if the newOwner already has a holding.
+          -- A more complex workflow would fetchByKey and exercise a Merge choice.
+          fmap Some $ create SecurityToken with owner = newOwner, quantity = amountToTransfer, ..
+        else do
+          -- Full transfer, no remainder for the original owner.
+          archive self
+          fmap Some $ create SecurityToken with owner = newOwner, quantity = amountToTransfer, ..
 
-    -- | The recipient of the offer accepts the transfer, atomically executing the
-    -- transfer of ownership. It handles splitting the original token holding if it's
-    -- a partial transfer and merges the received amount with any existing holding
-    -- of the same token by the new owner.
-    choice Accept_Transfer : ()
-      controller newOwner
+    -- | Allows the owner to split their token holding into two separate contracts.
+    choice Split : (ContractId SecurityToken, ContractId SecurityToken)
+      with
+        splitAmount : Decimal
+      controller owner
       do
-        -- Fetch the original token contract to be transferred.
-        originalToken <- fetch tokenCid
+        assertMsg "Token is locked and cannot be split." (not isLocked)
+        assertMsg "Split amount must be positive." (splitAmount > 0.0)
+        assertMsg "Split amount must be less than the total quantity." (splitAmount < quantity)
 
-        -- Verify the details of the token match the proposal.
-        originalToken.issuer === issuer
-        originalToken.owner === currentOwner
-        originalToken.quantity >= transferQuantity
-
-        -- Archive the proposal and the original token holding.
         archive self
-        archive tokenCid
 
-        -- Create a new token for the current owner with the remaining balance, if any.
-        let remainingQuantity = originalToken.quantity - transferQuantity
-        when (remainingQuantity > from_int 0) do
-          create originalToken with quantity = remainingQuantity
+        token1 <- create this with quantity = splitAmount
+        token2 <- create this with quantity = quantity - splitAmount
 
-        -- Check if the new owner already has a holding for this asset.
-        mbExistingToken <- lookupByKey @Token (issuer, newOwner, originalToken.assetId)
-        case mbExistingToken of
-          -- If no existing holding, create a new one.
-          None ->
-            create originalToken with
-              owner = newOwner
-              quantity = transferQuantity
-          -- If a holding exists, archive it and create a new merged holding.
-          Some (existingCid, existingToken) -> do
-            archive existingCid
-            create existingToken with
-              quantity = existingToken.quantity + transferQuantity
+        return (token1, token2)
 
-    -- | Allows either the sender or receiver to cancel the transfer proposal before
-    -- it is accepted.
-    choice Cancel_Transfer : ()
-      controller currentOwner, newOwner
+    -- | Allows the owner to merge this token holding with another one they own for the same asset.
+    choice Merge : ContractId SecurityToken
+      with
+        otherTokenCid : ContractId SecurityToken
+      controller owner
       do
+        otherToken <- fetch otherTokenCid
+        -- Ensure both tokens are for the same asset and owner, and belong to the same issuer.
+        assert (otherToken.owner == owner)
+        assert (otherToken.assetCid == assetCid)
+        assert (otherToken.issuer == issuer)
+        assertMsg "Tokens cannot be merged if either is locked." (not isLocked && not otherToken.isLocked)
+
         archive self
+        archive otherTokenCid
+
+        create this with quantity = quantity + otherToken.quantity
+
+    -- | Allows the issuer (acting as a regulator or administrator) to lock the token,
+    -- | preventing transfers or other actions, for example due to a court order.
+    choice Lock : ContractId SecurityToken
+      with
+        reason : Text -- The reason for the lock, for audit purposes.
+      controller issuer
+      do
+        assertMsg "Token is already locked." (not isLocked)
+        archive self
+        create this with isLocked = True
+
+    -- | Allows the issuer to unlock a previously locked token, re-enabling transfers.
+    choice Unlock : ContractId SecurityToken
+      with
+        reason : Text -- The reason for the unlock, for audit purposes.
+      controller issuer
+      do
+        assertMsg "Token is not locked." isLocked
+        archive self
+        create this with isLocked = False
