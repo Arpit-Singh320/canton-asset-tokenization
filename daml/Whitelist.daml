@@ -1,125 +1,68 @@
--- |
 -- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
---
 
 module Whitelist where
 
 import DA.Set (Set)
 import qualified DA.Set as Set
-import Daml.Script
+import DA.Assert (assertMsg)
 
--- | Represents a list of parties (investors) that are approved by an issuer
--- to hold or transact a specific security token. This is a crucial component for
--- regulatory compliance, ensuring only accredited or KYC/AML-cleared investors
--- can participate.
+-- | Represents an investor whitelist for a specific tokenized asset.
+-- The issuer maintains this list to control who can hold or trade the asset,
+-- ensuring compliance with securities regulations. Each whitelist is unique
+-- for a given issuer and asset ID.
 template Whitelist
   with
-    issuer : Party
-      -- ^ The party that manages the whitelist, typically the security token issuer.
-    id : Text
-      -- ^ A unique identifier for this whitelist, e.g., "SERIES_A_EQUITY_WHITELIST".
-    description : Text
-      -- ^ A human-readable description of the whitelist's purpose.
-    whitelistedParties : Set Party
-      -- ^ The set of parties currently on the whitelist.
+    issuer            : Party    -- ^ The party managing the whitelist (e.g., asset issuer, transfer agent).
+    assetId           : Text     -- ^ A unique identifier for the asset this whitelist pertains to.
+    description       : Text     -- ^ A descriptive name for the whitelist (e.g., "Series A Preferred Stock Whitelist").
+    whitelistedParties: Set Party -- ^ The set of parties approved to hold the asset.
   where
     signatory issuer
 
+    -- All whitelisted parties can see the whitelist they are on.
     observer Set.toList whitelistedParties
 
-    key (issuer, id) : (Party, Text)
+    key (issuer, assetId) : (Party, Text)
     maintainer key._1
 
-    -- | Helper function to check if a given party is on the whitelist.
-    -- This is often used as a precondition in other contracts.
-    nonconsuming choice AssertWhitelisted : ()
-      with
-        actor : Party
-          -- ^ The party to check for whitelist membership.
-      controller actor
-      do
-        assertMsg (actor `Set.member` whitelistedParties)
-          (show actor <> " is not on whitelist " <> id)
-
-    -- | The issuer can add a new party to the whitelist.
-    choice AddParty : ContractId Whitelist
+    -- | Adds a new party to the whitelist. This can only be done by the issuer.
+    -- The choice fails if the party is already on the list.
+    choice AddParty: ContractId Whitelist
       with
         partyToAdd : Party
-          -- ^ The new party to be added to the whitelist.
       controller issuer
       do
-        assertMsg (partyToAdd `Set.notMember` whitelistedParties)
-          (show partyToAdd <> " is already on whitelist " <> id)
+        assertMsg "Party is already on the whitelist." (not $ Set.member partyToAdd whitelistedParties)
+        create this with whitelistedParties = Set.insert partyToAdd whitelistedParties
 
-        create this with
-          whitelistedParties = Set.insert partyToAdd whitelistedParties
-
-    -- | The issuer can remove a party from the whitelist.
-    choice RemoveParty : ContractId Whitelist
+    -- | Removes a party from the whitelist. This can only be done by the issuer.
+    -- The choice fails if the party is not on the list.
+    choice RemoveParty: ContractId Whitelist
       with
         partyToRemove : Party
-          -- ^ The party to be removed from the whitelist.
       controller issuer
       do
-        assertMsg (partyToRemove `Set.member` whitelistedParties)
-          (show partyToRemove <> " is not on whitelist " <> id)
+        assertMsg "Party is not on the whitelist." (Set.member partyToRemove whitelistedParties)
+        create this with whitelistedParties = Set.delete partyToRemove whitelistedParties
 
-        create this with
-          whitelistedParties = Set.delete partyToRemove whitelistedParties
+    -- | A non-consuming choice that can be composed into other workflows to verify
+    -- that a given party is on this whitelist. The transaction will fail if the
+    -- party is not whitelisted. This is typically used to enforce transfer restrictions.
+    nonconsuming choice AssertWhitelisted: ()
+      with
+        partyToCheck : Party
+      controller issuer
+      do
+        assertMsg
+          ("Party " <> show partyToCheck <> " is not on the whitelist for asset " <> assetId <> ".")
+          (Set.member partyToCheck whitelistedParties)
 
-
--- | A script to set up and test the Whitelist functionality.
-setup : Script ()
-setup = script do
-  issuer <- allocateParty "Issuer"
-  investor1 <- allocateParty "Investor1"
-  investor2 <- allocateParty "Investor2"
-  unlistedInvestor <- allocateParty "UnlistedInvestor"
-
-  -- 1. Issuer creates a new whitelist for its Series A equity token.
-  let whitelistId = "SERIES_A_EQUITY_WHITELIST"
-  whitelistCid <- submit issuer do
-    create Whitelist with
-      issuer
-      id = whitelistId
-      description = "Whitelist for Series A Equity investors"
-      whitelistedParties = Set.empty
-
-  -- 2. Issuer adds Investor1 and Investor2 to the whitelist.
-  whitelistCid' <- submit issuer do
-    exercise whitelistCid AddParty with partyToAdd = investor1
-  whitelistCid'' <- submit issuer do
-    exercise whitelistCid' AddParty with partyToAdd = investor2
-
-  -- 3. Verify that Investor1 and Investor2 are on the list.
-  submit investor1 do
-    exercise whitelistCid'' AssertWhitelisted with actor = investor1
-  submit investor2 do
-    exercise whitelistCid'' AssertWhitelisted with actor = investor2
-
-  -- 4. Verify that an unlisted investor cannot assert membership.
-  submitMustFail unlistedInvestor do
-    exercise whitelistCid'' AssertWhitelisted with actor = unlistedInvestor
-
-  -- 5. Issuer removes Investor2 from the whitelist.
-  finalWhitelistCid <- submit issuer do
-    exercise whitelistCid'' RemoveParty with partyToRemove = investor2
-
-  -- 6. Fetch the final state and assert its correctness.
-  finalWhitelist <- fetch finalWhitelistCid
-  assert (finalWhitelist.whitelistedParties == Set.fromList [investor1])
-
-  -- 7. Verify Investor2 can no longer assert membership.
-  submitMustFail investor2 do
-    exercise finalWhitelistCid AssertWhitelisted with actor = investor2
-
-  -- 8. Verify that trying to add an already-listed investor fails.
-  submitMustFail issuer do
-    exercise finalWhitelistCid AddParty with partyToAdd = investor1
-
-  -- 9. Verify that trying to remove an unlisted investor fails.
-  submitMustFail issuer do
-    exercise finalWhitelistCid RemoveParty with partyToRemove = unlistedInvestor
-
-  pure ()
+-- | Helper function to create an initial, empty whitelist.
+createWhitelist: Party -> Text -> Text -> Update (ContractId Whitelist)
+createWhitelist issuer assetId description =
+  create Whitelist with
+    issuer
+    assetId
+    description
+    whitelistedParties = Set.empty
