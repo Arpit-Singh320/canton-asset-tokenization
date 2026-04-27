@@ -1,216 +1,209 @@
--- |
 -- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
---
 
-module CorporateAction where
+module Tokenization.CorporateAction where
 
+import Daml.Script
+
+import Tokenization.Asset (AssetId, AssetHolding)
 import DA.Date (Date)
-import DA.Action
-import DA.Assert
-import DA.List (elem, forA_)
-import DA.Numeric (Numeric)
-import qualified DA.Numeric as N
+import DA.Action (forA)
+import DA.Assert (assertMsg)
+import DA.Numeric (intToDecimal)
 
-import SecurityToken (SecurityToken)
-import Whitelist (Whitelist)
+-- | Defines the types of corporate actions that can be performed on a tokenized asset.
+data CorporateActionType
+  = -- | Represents a forward stock split, e.g., 2-for-1.
+    ForwardSplit with
+      fromShares: Int -- ^ The original number of shares in the ratio (e.g., 1).
+      toShares: Int   -- ^ The new number of shares in the ratio (e.g., 2).
 
--- #############################################################################
--- # Data Types
--- #############################################################################
+  | -- | Represents a reverse stock split, e.g., 1-for-10.
+    ReverseSplit with
+      fromShares: Int         -- ^ The original number of shares in the ratio (e.g., 10).
+      toShares: Int           -- ^ The new number of shares in the ratio (e.g., 1).
+      cashInLieuPerShare: Decimal -- ^ Cash amount paid for each pre-split share that becomes a fractional share.
 
--- | Details specific to a stock split corporate action.
-data StockSplitDetails = StockSplitDetails
-  with
-    splitRatioNumerator : Int
-      -- ^ The numerator of the split ratio (e.g., 2 in a 2-for-1 split).
-    splitRatioDenominator : Int
-      -- ^ The denominator of the split ratio (e.g., 1 in a 2-for-1 split).
-  deriving (Eq, Show)
+  | -- | Represents the merger of one asset into another.
+    Merger with
+      acquiringAssetId: AssetId  -- ^ The `AssetId` of the asset being issued in exchange.
+      targetAssetId: AssetId     -- ^ The `AssetId` of the asset being acquired/delisted.
+      sharesPerTargetShare: Decimal -- ^ How many shares of the acquiring asset are given for one share of the target asset.
+      cashInLieuPerShare: Decimal -- ^ Cash amount paid for each fractional share of the *acquiring* asset.
 
--- | Details specific to a merger corporate action.
-data MergerDetails = MergerDetails
-  with
-    acquiringIssuer : Party
-      -- ^ The issuer of the new security post-merger.
-    acquiringIsin : Text
-      -- ^ The ISIN of the new security.
-    conversionRatio : Numeric 10
-      -- ^ The number of new shares received for each old share (e.g., 0.5).
-  deriving (Eq, Show)
+  deriving (Eq, Show, Ord)
 
--- | A sum type to encapsulate the details of different corporate action types.
-data ActionDetails =
-    Split StockSplitDetails
-  | Merge MergerDetails
-  deriving (Eq, Show)
-
--- #############################################################################
--- # Templates
--- #############################################################################
-
--- | A proposal for a corporate action, which must be approved by a regulator
--- | before it can be executed.
+-- | A proposal by an asset issuer to perform a corporate action on a specific asset class.
+-- This contract acts as the instruction and authority for the `operator` to execute the action.
 template CorporateActionProposal
   with
-    issuer : Party
-      -- ^ The issuer of the security undergoing the corporate action.
-    regulator : Party
-      -- ^ The regulatory body that must approve the action.
-    isin : Text
-      -- ^ The ISIN of the security being affected.
-    actionDetails : ActionDetails
-      -- ^ The specific details of the action (split or merger).
-    effectiveDate : Date
-      -- ^ The date on which the action will take effect.
-    narration : Text
-      -- ^ A human-readable description of the corporate action.
+    issuer: Party
+      -- ^ The legal issuer of the asset, who authorizes the action.
+    operator: Party
+      -- ^ The party responsible for executing the mechanics of the corporate action (e.g., a CSD, transfer agent).
+    assetId: AssetId
+      -- ^ The identifier of the asset undergoing the corporate action.
+    actionType: CorporateActionType
+      -- ^ The specific type and parameters of the action.
+    effectiveDate: Date
+      -- ^ The date on which the action becomes effective.
   where
     signatory issuer
-    observer regulator
+    observer operator
 
-    -- | Allows the regulator to reject the proposal, archiving it.
-    choice Reject : ()
-      with
-        reason : Text
-          -- ^ The reason for the rejection.
-      controller regulator
-      do
-        archive self
-
-    -- | Allows the regulator to approve the proposal, creating an agreement.
-    choice Approve : ContractId CorporateActionAgreement
-      controller regulator
-      do
-        create CorporateActionAgreement with ..
-
--- | An approved corporate action that is ready for execution by the issuer.
--- | This contract is created after a regulator approves a `CorporateActionProposal`.
-template CorporateActionAgreement
-  with
-    issuer : Party
-    regulator : Party
-    isin : Text
-    actionDetails : ActionDetails
-    effectiveDate : Date
-    narration : Text
-  where
-    signatory issuer, regulator
-
-    key (issuer, isin, effectiveDate) : (Party, Text, Date)
+    key (issuer, assetId, effectiveDate, actionType) : (Party, AssetId, Date, CorporateActionType)
     maintainer key._1
 
-    -- | Executes a stock split. Archives existing security tokens and creates
-    -- | new ones with the adjusted quantity based on the split ratio.
-    choice Execute_Stock_Split : ()
-      with
-        tokenCids : [ContractId SecurityToken]
-          -- ^ A list of token contracts to be processed in this action.
+    -- | Allows the issuer to cancel the proposal before it is executed.
+    choice Cancel : ()
       controller issuer
       do
-        -- Ensure the action details are correct for this choice
-        details <- case actionDetails of
-          Split d -> pure d
-          _ -> abort ("Execute_Stock_Split can only be exercised for a 'Split' action, not '" <> show actionDetails <> "'.")
+        return ()
 
-        -- In a real implementation, one would check `getTime` against the effectiveDate.
-        -- For simplicity, we assume this check is performed off-ledger before submission.
-
-        -- Process each token contract
-        forA_ tokenCids \tokenCid -> do
-          token <- fetch tokenCid
-          assertMsg ("Token ISIN " <> token.isin <> " does not match action ISIN " <> isin) (token.isin == isin)
-          assertMsg ("Token issuer " <> show token.issuer <> " does not match action issuer " <> show issuer) (token.issuer == issuer)
-
-          -- Archive the old token
-          archive tokenCid
-
-          -- Calculate the new quantity
-          let newQuantity = token.quantity * N.fromInt details.splitRatioNumerator / N.fromInt details.splitRatioDenominator
-
-          -- Create the new, post-split token, preserving all other details.
-          create token with quantity = newQuantity
-
-        -- Archive the agreement to prevent re-execution
-        archive self
-
-    -- | Executes a merger. Archives existing security tokens and creates
-    -- | `MergerClaim` contracts for each holder to redeem their new shares
-    -- | from the acquiring issuer.
-    choice Execute_Merger : ()
+    -- | Executes the corporate action for a given batch of asset holdings.
+    -- This choice can be called multiple times for different batches of holdings,
+    -- allowing for processing of large numbers of shareholders without hitting
+    -- transaction size limits.
+    choice Execute : [ContractId CorporateActionReceipt]
+      controller operator
       with
-        tokenCids : [ContractId SecurityToken]
-          -- ^ A list of token contracts to be processed in this action.
-      controller issuer
+        holdingCids: [ContractId AssetHolding]
+          -- ^ A list of `AssetHolding` contracts to be processed in this batch.
       do
-        details <- case actionDetails of
-          Merge d -> pure d
-          _ -> abort ("Execute_Merger can only be exercised for a 'Merge' action, not '" <> show actionDetails <> "'.")
+        -- Fetch all holding contracts to access their data.
+        holdings <- forA holdingCids fetch
 
-        forA_ tokenCids \tokenCid -> do
-          token <- fetch tokenCid
-          assertMsg ("Token ISIN " <> token.isin <> " does not match action ISIN " <> isin) (token.isin == isin)
-          assertMsg ("Token issuer " <> show token.issuer <> " does not match action issuer " <> show issuer) (token.issuer == issuer)
+        -- Process each holding according to the specified action type.
+        case actionType of
+          ForwardSplit split -> do
+            assertMsg "toShares must be greater than fromShares for a forward split" (split.toShares > split.fromShares)
+            assertMsg "fromShares must be positive" (split.fromShares > 0)
 
-          archive tokenCid
+            forA holdings (\holding -> do
+              assertMsg ("Holding " <> show holding.id <> " is not for the target asset " <> show assetId)
+                (holding.assetId == assetId)
 
-          let newQuantity = token.quantity * details.conversionRatio
+              -- Calculate the new quantity using the split ratio.
+              let newQuantity = (holding.quantity * intToDecimal split.toShares) / intToDecimal split.fromShares
 
-          -- Create a claim for the new shares from the acquiring company
-          create MergerClaim with
-            originalOwner = token.owner
-            originalIssuer = issuer
-            originalQuantity = token.quantity
-            acquiringIssuer = details.acquiringIssuer
-            acquiringIsin = details.acquiringIsin
-            newQuantity = newQuantity
-            regulator
+              archive holding.id
+              newHoldingCid <- create holding with quantity = newQuantity
 
-        archive self
+              -- Create a receipt for auditability.
+              create CorporateActionReceipt with
+                issuer
+                owner = holding.owner
+                operator
+                originalHolding = holding
+                newHoldings = [(newHoldingCid, holding.assetId, newQuantity)]
+                cashInLieuPaid = None
+                actionDetails = actionType
+                ..
+            )
 
--- | A claim representing a holder's right to receive new securities from an
--- | acquiring company following a merger. This contract is created by the
--- | `Execute_Merger` choice.
-template MergerClaim
+          ReverseSplit split -> do
+            assertMsg "fromShares must be greater than toShares for a reverse split" (split.fromShares > split.toShares)
+            assertMsg "toShares must be positive" (split.toShares > 0)
+
+            forA holdings (\holding -> do
+              assertMsg ("Holding " <> show holding.id <> " is not for the target asset " <> show assetId)
+                (holding.assetId == assetId)
+
+              -- Calculate the precise new quantity, which may be fractional.
+              let
+                preciseNewQuantity = (holding.quantity * intToDecimal split.toShares) / intToDecimal split.fromShares
+                newWholeQuantity = truncate preciseNewQuantity
+                fractionalPart = preciseNewQuantity - newWholeQuantity
+                -- Cash is paid based on the pre-split fractional entitlement.
+                cashPaid = fractionalPart * intToDecimal split.fromShares * split.cashInLieuPerShare
+
+              archive holding.id
+
+              -- Create a new holding only if the owner is entitled to at least one whole share.
+              newHoldingInfo <- if newWholeQuantity > 0.0
+                then do
+                  newCid <- create holding with quantity = newWholeQuantity
+                  return [(newCid, holding.assetId, newWholeQuantity)]
+                else return []
+
+              create CorporateActionReceipt with
+                issuer
+                owner = holding.owner
+                operator
+                originalHolding = holding
+                newHoldings = newHoldingInfo
+                cashInLieuPaid = if cashPaid > 0.0 then Some cashPaid else None
+                actionDetails = actionType
+                ..
+            )
+
+          Merger merger -> do
+            -- The proposal's assetId must be the one being targeted for the merger.
+            assertMsg "Proposal's assetId must match the merger's targetAssetId" (assetId == merger.targetAssetId)
+
+            forA holdings (\holding -> do
+              assertMsg ("Holding " <> show holding.id <> " is not for the target asset " <> show merger.targetAssetId)
+                (holding.assetId == merger.targetAssetId)
+
+              -- Calculate the new quantity of the acquiring asset.
+              let
+                preciseNewQuantity = holding.quantity * merger.sharesPerTargetShare
+                newWholeQuantity = truncate preciseNewQuantity
+                fractionalPart = preciseNewQuantity - newWholeQuantity
+                -- Cash is paid based on the fractional part of the new, acquiring asset.
+                cashPaid = fractionalPart * merger.cashInLieuPerShare
+
+              archive holding.id
+
+              -- Create a new holding of the acquiring asset if any whole shares are due.
+              newHoldingInfo <- if newWholeQuantity > 0.0
+                then do
+                  newCid <- create holding with
+                                  assetId = merger.acquiringAssetId
+                                  quantity = newWholeQuantity
+                  return [(newCid, merger.acquiringAssetId, newWholeQuantity)]
+                else return []
+
+              create CorporateActionReceipt with
+                issuer
+                owner = holding.owner
+                operator
+                originalHolding = holding
+                newHoldings = newHoldingInfo
+                cashInLieuPaid = if cashPaid > 0.0 then Some cashPaid else None
+                actionDetails = actionType
+                ..
+            )
+
+-- | A receipt that serves as an immutable audit record of a corporate action's effect
+-- on a single shareholder's position.
+-- It is signed by both the issuer and the owner, confirming the transformation of assets.
+template CorporateActionReceipt
   with
-    originalOwner : Party
-      -- ^ The owner of the original shares.
-    originalIssuer : Party
-      -- ^ The issuer of the original, now-defunct, shares.
-    originalQuantity : Numeric 10
-      -- ^ The quantity of original shares held.
-    acquiringIssuer : Party
-      -- ^ The issuer of the new shares.
-    acquiringIsin : Text
-      -- ^ The ISIN of the new shares.
-    newQuantity : Numeric 10
-      -- ^ The quantity of new shares the owner is entitled to.
-    regulator : Party
+    issuer: Party
+      -- ^ The issuer of the asset.
+    operator: Party
+      -- ^ The party that executed the action.
+    owner: Party
+      -- ^ The shareholder whose holding was affected.
+    originalHolding: AssetHolding
+      -- ^ A copy of the data from the original `AssetHolding` contract that was archived.
+    newHoldings: [(ContractId AssetHolding, AssetId, Decimal)]
+      -- ^ A list of new holdings created, including their contract ID, asset ID, and quantity.
+      --   This list can be empty if the holder's position was fully cashed out.
+    cashInLieuPaid: Optional Decimal
+      -- ^ The amount of cash paid out for fractional shares, if any.
+    actionDetails: CorporateActionType
+      -- ^ The details of the corporate action performed.
+    effectiveDate: Date
+      -- ^ The effective date of the action.
   where
-    signatory originalIssuer, acquiringIssuer
-    observer originalOwner, regulator
+    signatory issuer, owner
+    observer operator
 
-    key (acquiringIssuer, acquiringIsin, originalOwner) : (Party, Text, Party)
-    maintainer key._1
-
-    -- | Allows the original owner to redeem their claim, receiving new security
-    -- | tokens from the acquiring issuer.
-    nonconsuming choice Redeem_Claim : ContractId SecurityToken
-      with
-        whitelistCid: ContractId Whitelist
-          -- ^ Proof that the owner is whitelisted for the new security.
-      controller originalOwner, acquiringIssuer
+    -- | Allows the owner to acknowledge receipt of the corporate action's outcome.
+    -- This is primarily for UI/workflow purposes and does not change the ledger state.
+    choice Acknowledge: ()
+      controller owner
       do
-        -- Verify the owner is on the whitelist for the new security
-        whitelist <- fetch whitelistCid
-        assertMsg "Whitelist must be issued by the acquiring issuer." (whitelist.issuer == acquiringIssuer)
-        assertMsg "Original owner is not on the whitelist for the new security." (elem originalOwner whitelist.allowedParties)
-
-        -- The acquiring issuer creates the new security token for the owner
-        create SecurityToken with
-          issuer = acquiringIssuer
-          owner = originalOwner
-          isin = acquiringIsin
-          quantity = newQuantity
-          description = "Issued via merger from " <> originalIssuer
-          observers = [] -- The acquiring issuer may define its own standard observers.
+        return ()
