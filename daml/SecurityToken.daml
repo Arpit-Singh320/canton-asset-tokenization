@@ -1,156 +1,185 @@
+-- | This module defines the core contracts for creating and managing security tokens,
+-- | which represent ownership of real-world assets. It includes mechanisms for
+-- | transfer restrictions via whitelists to ensure regulatory compliance.
+--
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
 module SecurityToken where
 
-import DA.Next.Set (Set)
-import qualified DA.Next.Set as Set
-import DA.Assert ((assert, assertMsg))
+import Daml.Script
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Assert ((===))
 
--- | Represents the underlying real-world asset being tokenized, such as a building or a private fund.
--- The issuer is the entity that created and manages the asset and its tokenization.
-template Asset
+-- | Represents the underlying real-world asset that the security token is linked to.
+-- This provides essential metadata about the asset.
+data AssetReference = AssetReference
   with
-    issuer : Party
-    assetId : Text
-    description : Text
-    assetType : Text -- e.g., "REAL_ESTATE", "PRIVATE_EQUITY", "FUND_UNITS"
-    approvedHolders : Set Party
+    id : Text          -- ^ A unique identifier for the asset (e.g., ISIN, CUSIP, or internal ID).
+    description : Text -- ^ A human-readable description of the asset (e.g., "123 Main St, Anytown", "Series A Preferred Stock").
+  deriving (Eq, Show, Ord)
+
+-- | Manages the list of parties authorized to hold a specific security token.
+-- This is a critical component for regulatory compliance (e.g., KYC/AML checks).
+-- There is one Whitelist contract per tokenized asset.
+template Whitelist
+  with
+    issuer : Party         -- ^ The entity that issued the asset and controls the whitelist.
+    assetId : Text         -- ^ The unique identifier of the asset this whitelist pertains to.
+    allowedParties : Set Party -- ^ The set of parties currently authorized to hold the token.
   where
     signatory issuer
 
     key (issuer, assetId) : (Party, Text)
     maintainer key._1
 
-    -- | The issuer can add a new party to the whitelist of approved holders.
-    -- | This is crucial for maintaining compliance with KYC/AML regulations.
-    choice AddApprovedHolder : ContractId Asset
+    -- | Choice for the issuer to add a new party to the whitelist.
+    choice AddParty : ContractId Whitelist
       with
-        newHolder : Party
+        partyToAdd : Party
       controller issuer
       do
-        assertMsg ("Holder " <> show newHolder <> " is already approved.") (not $ Set.member newHolder approvedHolders)
-        create this with approvedHolders = Set.insert newHolder this.approvedHolders
+        assertMsg "Party is already on the whitelist" (not $ Set.member partyToAdd allowedParties)
+        create this with allowedParties = Set.insert partyToAdd allowedParties
 
-    -- | The issuer can remove a party from the whitelist.
-    choice RemoveApprovedHolder : ContractId Asset
+    -- | Choice for the issuer to remove a party from the whitelist.
+    choice RemoveParty : ContractId Whitelist
       with
-        holderToRemove : Party
+        partyToRemove : Party
       controller issuer
       do
-        assertMsg ("Holder " <> show holderToRemove <> " not found in approved list.") (Set.member holderToRemove approvedHolders)
-        create this with approvedHolders = Set.delete holderToRemove this.approvedHolders
+        assertMsg "Party is not on the whitelist" (Set.member partyToRemove allowedParties)
+        create this with allowedParties = Set.delete partyToRemove allowedParties
 
--- | Represents a holding of a specific security token, representing fractional
--- | ownership of an underlying asset. The contract includes a lock mechanism
--- | for regulatory freezes.
-template SecurityToken
+-- | Represents a holding of a security token.
+-- Each instance of this contract represents a fractional ownership stake in the
+-- underlying asset for a specific owner.
+template Token
   with
-    issuer : Party
-    owner : Party
-    assetCid : ContractId Asset
-    quantity : Decimal
-    isLocked : Bool -- If True, the token is frozen and cannot be transferred.
+    issuer : Party                 -- ^ The party that issued the token.
+    owner : Party                  -- ^ The current owner of this token holding.
+    quantity : Decimal             -- ^ The amount of the asset owned.
+    asset : AssetReference         -- ^ Details of the underlying real-world asset.
+    whitelistCid : ContractId Whitelist -- ^ Reference to the whitelist governing this token.
   where
     signatory issuer, owner
-    observer issuer -- Issuer maintains oversight of all tokens.
 
-    key (issuer, owner, assetCid) : (Party, Party, ContractId Asset)
-    maintainer key._1
-
-    -- Ensures the owner is on the approved list for the underlying asset.
-    ensure
-      do
-        asset <- fetch assetCid
-        assertMsg ("Owner " <> show owner <> " is not an approved holder for this asset.")
-          (Set.member owner asset.approvedHolders)
-
-    -- | Allows the owner to transfer a portion or all of their tokens to another approved holder.
-    -- | This action is blocked if the token holding is locked by the issuer.
-    choice Transfer : Optional (ContractId SecurityToken)
+    -- | The owner can propose a transfer of their tokens to a new owner.
+    -- The transfer is only valid if the new owner is on the asset's whitelist.
+    choice Transfer : ContractId Token
       with
         newOwner : Party
-        amountToTransfer : Decimal
       controller owner
       do
-        -- Regulatory lock check
-        assertMsg "Token is locked by the issuer and cannot be transferred." (not isLocked)
+        -- Ensure the owner is not transferring to themselves.
+        assertMsg "Cannot transfer to self" (newOwner /= owner)
 
-        -- Validation checks
-        assertMsg "Transfer amount must be positive." (amountToTransfer > 0.0)
-        assertMsg "Transfer amount cannot exceed current quantity." (amountToTransfer <= quantity)
-        assertMsg "Cannot transfer to self." (newOwner /= owner)
+        -- Fetch the referenced whitelist contract to check for authorization.
+        whitelist <- fetch whitelistCid
+        assertMsg "Whitelist issuer mismatch" (whitelist.issuer == issuer)
+        assertMsg "Whitelist asset ID mismatch" (whitelist.assetId == asset.id)
 
-        -- Verify the new owner is on the approved list for this asset.
-        asset <- fetch assetCid
-        assertMsg ("New owner " <> show newOwner <> " is not an approved holder for this asset.")
-          (Set.member newOwner asset.approvedHolders)
+        -- The core transfer restriction: the new owner must be in the allowed set.
+        assertMsg "New owner is not on the whitelist for this asset"
+          (Set.member newOwner whitelist.allowedParties)
 
-        let remainingQuantity = quantity - amountToTransfer
+        -- Create the new token holding for the new owner.
+        create this with owner = newOwner
 
-        -- If part of the holding is transferred, create a new contract for the remainder.
-        -- Otherwise, the original contract is implicitly consumed by creating the new one.
-        if remainingQuantity > 0.0
-        then do
-          create this with quantity = remainingQuantity
-          -- Create a new token holding for the new owner.
-          -- This might fail on key collision if the newOwner already has a holding.
-          -- A more complex workflow would fetchByKey and exercise a Merge choice.
-          fmap Some $ create SecurityToken with owner = newOwner, quantity = amountToTransfer, ..
-        else do
-          -- Full transfer, no remainder for the original owner.
-          archive self
-          fmap Some $ create SecurityToken with owner = newOwner, quantity = amountToTransfer, ..
-
-    -- | Allows the owner to split their token holding into two separate contracts.
-    choice Split : (ContractId SecurityToken, ContractId SecurityToken)
+    -- | Allows the owner to split their token holding into multiple smaller holdings.
+    -- This is useful for partial sales or distribution.
+    choice Split : [ContractId Token]
       with
-        splitAmount : Decimal
+        splitQuantities : [Decimal]
       controller owner
       do
-        assertMsg "Token is locked and cannot be split." (not isLocked)
-        assertMsg "Split amount must be positive." (splitAmount > 0.0)
-        assertMsg "Split amount must be less than the total quantity." (splitAmount < quantity)
+        -- Ensure that the split amounts are positive and sum to the original quantity.
+        assertMsg "Split quantities must all be positive" (all (\q -> q > 0.0) splitQuantities)
+        assertMsg "Split quantities must sum to the total quantity" (sum splitQuantities == quantity)
 
-        archive self
+        -- Create a new Token contract for each split amount.
+        mapA (\q -> create this with quantity = q) splitQuantities
 
-        token1 <- create this with quantity = splitAmount
-        token2 <- create this with quantity = quantity - splitAmount
-
-        return (token1, token2)
-
-    -- | Allows the owner to merge this token holding with another one they own for the same asset.
-    choice Merge : ContractId SecurityToken
+    -- | Allows the owner to merge multiple token holdings of the same asset into a single holding.
+    -- This helps in consolidating the owner's portfolio view.
+    nonconsuming choice Merge : ContractId Token
       with
-        otherTokenCid : ContractId SecurityToken
+        tokenCidsToMerge : [ContractId Token]
       controller owner
       do
-        otherToken <- fetch otherTokenCid
-        -- Ensure both tokens are for the same asset and owner, and belong to the same issuer.
-        assert (otherToken.owner == owner)
-        assert (otherToken.assetCid == assetCid)
-        assert (otherToken.issuer == issuer)
-        assertMsg "Tokens cannot be merged if either is locked." (not isLocked && not otherToken.isLocked)
+        -- Fetch and validate all contracts to be merged.
+        tokensToMerge <- mapA fetch tokenCidsToMerge
+        let totalMergedQuantity = sum (map (\t -> t.quantity) tokensToMerge)
 
-        archive self
-        archive otherTokenCid
+        forA_ tokensToMerge (\t -> do
+          assertMsg "Cannot merge tokens with different owners" (t.owner == owner)
+          assertMsg "Cannot merge tokens from different issuers" (t.issuer == issuer)
+          assertMsg "Cannot merge tokens for different assets" (t.asset == asset)
+          assertMsg "Cannot merge tokens governed by different whitelists" (t.whitelistCid == whitelistCid)
+          )
 
-        create this with quantity = quantity + otherToken.quantity
+        -- Archive the other contracts that are being merged.
+        mapA_ archive tokenCidsToMerge
 
-    -- | Allows the issuer (acting as a regulator or administrator) to lock the token,
-    -- | preventing transfers or other actions, for example due to a court order.
-    choice Lock : ContractId SecurityToken
-      with
-        reason : Text -- The reason for the lock, for audit purposes.
-      controller issuer
-      do
-        assertMsg "Token is already locked." (not isLocked)
-        archive self
-        create this with isLocked = True
+        -- Create a new consolidated token holding.
+        create this with quantity = quantity + totalMergedQuantity
 
-    -- | Allows the issuer to unlock a previously locked token, re-enabling transfers.
-    choice Unlock : ContractId SecurityToken
-      with
-        reason : Text -- The reason for the unlock, for audit purposes.
-      controller issuer
-      do
-        assertMsg "Token is not locked." isLocked
-        archive self
-        create this with isLocked = False
+-- === Setup Script for Testing ===
+-- A simple script to demonstrate the creation and transfer of a security token.
+setup : Script ()
+setup = script do
+  -- 1. Allocate parties
+  issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "issuer-001")
+  alice <- allocatePartyWithHint "Alice" (PartyIdHint "alice-001")
+  bob <- allocatePartyWithHint "Bob" (PartyIdHint "bob-001")
+  charlie <- allocatePartyWithHint "Charlie" (PartyIdHint "charlie-001") -- Not on whitelist initially
+
+  -- 2. Define the asset
+  let realEstateAsset = AssetReference with
+        id = "RE-NYC-123"
+        description = "40% stake in 123 Main Street, NYC"
+
+  -- 3. Issuer creates the whitelist for the asset and adds initial allowed parties.
+  whitelistCid <- submit issuer do
+    createCmd Whitelist with
+      issuer
+      assetId = realEstateAsset.id
+      allowedParties = Set.fromList [issuer, alice, bob]
+
+  -- 4. Issuer creates (mints) a new token and issues it to an initial owner (Alice).
+  tokenCid <- submit issuer do
+    createCmd Token with
+      issuer
+      owner = alice
+      quantity = 1000.0
+      asset = realEstateAsset
+      whitelistCid
+
+  -- 5. Alice (the owner) transfers some tokens to Bob (who is on the whitelist).
+  -- This should succeed.
+  aliceToken <- fetch tokenCid
+  splitCids <- submit alice do exerciseCmd tokenCid Split with splitQuantities = [250.0, 750.0]
+  let tokenToTransferCid = head splitCids
+  submit alice do exerciseCmd tokenToTransferCid Transfer with newOwner = bob
+  debug "Successfully transferred 250.0 units from Alice to Bob."
+
+  -- 6. Alice tries to transfer tokens to Charlie (who is NOT on the whitelist).
+  -- This should fail as expected.
+  let anotherTokenCid = (assertSome (headMay (tail splitCids)))
+  transferToCharlieResult <- submitMustFail alice do
+    exerciseCmd anotherTokenCid Transfer with newOwner = charlie
+  debug $ "Attempted transfer to non-whitelisted party Charlie failed as expected: " <> show transferToCharlieResult
+
+  -- 7. Issuer adds Charlie to the whitelist.
+  updatedWhitelistCid <- submit issuer do
+    exerciseCmd whitelistCid AddParty with partyToAdd = charlie
+  debug "Issuer added Charlie to the whitelist."
+
+  -- 8. Alice tries the transfer to Charlie again.
+  -- This should now succeed.
+  submit alice do
+    exerciseCmd anotherTokenCid Transfer with newOwner = charlie
+  debug "Successfully transferred remaining 750.0 units from Alice to Charlie."
+
+  debug "Security Token setup and transfer scenario completed."
+  return ()
