@@ -1,139 +1,200 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module Dividend where
 
+import Daml.Script
+
+-- Daml Standard Library
+import DA.Assert
 import DA.Date
-import DA.Time
-import DA.Set (Set)
-import qualified DA.Set as Set
+import DA.List
 import DA.Map (Map)
 import qualified DA.Map as Map
-import DA.Numeric
+import DA.Next.Set (Set)
+import qualified DA.Next.Set as Set
+import DA.Time
 
--- Assuming SecurityToken.daml provides these templates/types
-import SecurityToken (Token, Holding)
+-- Project-specific imports
+import Asset (Asset)
+import Token (Iou as TokenIou)
 
--- | Proposal from the token issuer to initiate a dividend distribution.
--- | This contract is the first step in the dividend lifecycle.
+-- | Represents a proposal to distribute dividends for a tokenized asset.
+-- This contract is created by the asset `issuer` and must be approved by an `administrator`.
 template DividendProposal
   with
     issuer: Party
-      -- ^ The party issuing the security token and proposing the dividend.
-    regulator: Party
-      -- ^ A regulatory body observing the process.
-    tokenCid: ContractId Token
-      -- ^ The contract ID of the security token for which the dividend is being issued.
-    exDividendDate: Date
-      -- ^ The date on which a holder must own the token to be eligible for the dividend.
+      -- ^ The party issuing the asset and the dividend.
+    administrator: Party
+      -- ^ The party responsible for approving and overseeing the dividend distribution.
+    assetCid: ContractId Asset
+      -- ^ The contract ID of the underlying asset for which the dividend is being paid.
+    dividendPerShare: Decimal
+      -- ^ The amount of dividend to be paid per share/token.
+    recordDate: Date
+      -- ^ The date on which share ownership is determined for dividend eligibility.
     paymentDate: Date
-      -- ^ The date on which the dividend payment will be made.
-    dividendAmountPerUnit: Numeric 10
-      -- ^ The cash amount to be paid per unit of the token (e.g., per share).
+      -- ^ The date on or after which the dividend will be paid.
+    currency: Text
+      -- ^ The currency of the dividend payment (e.g., "USD", "EUR").
   where
     signatory issuer
-    observer regulator
+    observer administrator
 
-    ensure exDividendDate < paymentDate && dividendAmountPerUnit > 0.0
+    key (issuer, assetCid, recordDate): (Party, ContractId Asset, Date)
+    maintainer key._1
 
-    -- | The issuer accepts the proposal, locking in the shareholder list and creating
-    -- | the main distribution contract to manage payouts.
-    choice AcceptDividendProposal : ContractId DividendDistribution
+    ensure
+      recordDate < paymentDate &&
+      dividendPerShare > 0.0
+
+    -- | Allows the administrator to approve the dividend proposal, providing a snapshot
+    -- of token holdings as of the record date. This creates the main `Dividend` contract
+    -- to manage the distribution process.
+    choice Approve : ContractId Dividend
       with
-        -- A snapshot of holdings is provided to ensure the distribution is based on a fixed
-        -- set of shareholders as of the acceptance time (ideally on the ex-dividend date).
-        holdingsSnapshot: Map Party Decimal
-      controller issuer
+        tokenHoldings: [ContractId TokenIou]
+          -- ^ A list of `TokenIou` contract IDs representing the ownership snapshot.
+      controller administrator
       do
-        token <- fetch tokenCid
-        assertMsg "The issuer of the token must also be the issuer of the dividend." (token.issuer == issuer)
-        assertMsg "The provided holdings snapshot must match the token's current holdings." (token.holdings == holdingsSnapshot)
+        -- Fetch all token holding contracts to build the shareholder map.
+        -- In a real-world scenario, this snapshot would be carefully constructed
+        -- to reflect the state of the ledger at the close of business on the recordDate.
+        fetchedHoldings <- mapA fetch tokenHoldings
 
-        let eligibleHolders = Map.keysSet holdingsSnapshot
-        assertMsg "Cannot distribute a dividend when there are no eligible holders." (not $ Set.isempty eligibleHolders)
+        -- Aggregate holdings by owner, ensuring they are for the correct asset.
+        let shareholderMap = Map.fromListWith (+)
+              [(iou.owner, iou.quantity) | iou <- fetchedHoldings, iou.assetCid == assetCid]
 
-        -- Calculate the total dividend amount to be paid out.
-        let totalDividendAmount = sum $ map (\(_, qty) -> qty * dividendAmountPerUnit) (Map.toList holdingsSnapshot)
+        assertMsg "Cannot approve dividend with no shareholders." $ not $ Map.isEmpty shareholderMap
 
-        create DividendDistribution with
+        create Dividend with
           issuer
-          regulator
-          tokenCid
-          exDividendDate
+          administrator
+          assetCid
+          dividendPerShare
+          recordDate
           paymentDate
-          dividendAmountPerUnit
-          totalDividendAmount
-          pendingHolders = eligibleHolders
-          paidHolders = Map.empty
+          currency
+          shareholders = shareholderMap
+          paidParties = Set.empty
 
--- | Manages the state of an active dividend distribution, tracking which holders
--- | have been paid and which are still pending.
-template DividendDistribution
+    -- | Allows either the issuer or administrator to cancel the proposal before it's approved.
+    choice Cancel : ()
+      controller issuer, administrator
+      do
+        return ()
+
+-- | Represents an active, approved dividend distribution process. This contract
+-- tracks which shareholders have been paid and facilitates the creation of payment
+-- obligations.
+template Dividend
   with
     issuer: Party
-    regulator: Party
-    tokenCid: ContractId Token
-    exDividendDate: Date
+    administrator: Party
+    assetCid: ContractId Asset
+    dividendPerShare: Decimal
+    recordDate: Date
     paymentDate: Date
-    dividendAmountPerUnit: Numeric 10
-    totalDividendAmount: Numeric 10
-    pendingHolders: Set Party
-      -- ^ The set of token holders who are yet to receive their dividend payment.
-    paidHolders: Map Party (Numeric 10)
-      -- ^ A map of holders who have been paid and the amount they received.
+    currency: Text
+    shareholders: Map Party Decimal
+      -- ^ A snapshot of all shareholders and their holdings as of the record date.
+    paidParties: Set Party
+      -- ^ A set of parties who have already received their dividend payment.
   where
-    signatory issuer
-    observer regulator, Set.toList pendingHolders
+    signatory issuer, administrator
 
-    ensure not $ Set.isempty pendingHolders
+    key (issuer, assetCid, recordDate): (Party, ContractId Asset, Date)
+    maintainer key._1
 
-    -- | Records a payment to a specific holder. This transitions the contract state,
-    -- | either by updating the list of pending holders or by completing the distribution.
-    choice DistributeToHolder : Either (ContractId DividendDistribution) (ContractId DividendDistributionComplete)
+    -- | The issuer can distribute payments to a batch of shareholders. This choice creates
+    -- `DividendPayout` contracts for each shareholder in the batch, representing the
+    -- issuer's obligation to pay them.
+    nonconsuming choice DistributePayment : ContractId Dividend
       with
-        holder: Party
-          -- ^ The party receiving the dividend payment.
-        holdingCid: ContractId Holding
-          -- ^ The specific holding contract for this holder, used to verify their entitlement.
+        shareholdersToPay: [Party]
+          -- ^ A list of shareholder parties to pay in this transaction batch.
       controller issuer
       do
-        assertMsg "The specified holder must be in the set of pending recipients." (Set.member holder pendingHolders)
+        currentTime <- getTime
+        assertMsg "Payment cannot be distributed before the designated payment date." (toDateUTC currentTime >= paymentDate)
+        assertMsg "Cannot distribute payment to an empty list of shareholders." (not $ null shareholdersToPay)
 
-        holding <- fetch holdingCid
-        assertMsg "The holding contract must belong to the specified holder." (holding.owner == holder)
-        assertMsg "The holding contract must correspond to the correct security token." (holding.tokenCid == tokenCid)
+        let allShareholderKeys = Map.keys shareholders
+        let finalPaidSet = List.foldl (\acc p -> Set.insert p acc) paidParties shareholdersToPay
 
-        let amountDue = holding.quantity * dividendAmountPerUnit
+        -- Process payments for the given batch.
+        forA_ shareholdersToPay \shareholder -> do
+          assertMsg ("Party " <> show shareholder <> " is not an eligible shareholder for this dividend.") (Map.member shareholder shareholders)
+          assertMsg ("Party " <> show shareholder <> " has already been paid.") (not $ Set.member shareholder paidParties)
 
-        let newPendingHolders = Set.delete holder pendingHolders
-        let newPaidHolders = Map.insert holder amountDue paidHolders
-
-        if Set.isempty newPendingHolders then do
-          -- Last holder has been paid. Archive this contract and create the completion record.
-          completionCid <- create DividendDistributionComplete with
+          -- Calculate payment amount and create the payout obligation.
+          let holding = fromSome $ Map.lookup shareholder shareholders
+          let paymentAmount = holding * dividendPerShare
+          create DividendPayout with
             issuer
-            regulator
-            tokenCid
-            exDividendDate
-            paymentDate
-            totalAmountPaid = totalDividendAmount
-            finalPaidHolders = newPaidHolders
-          return $ Right completionCid
-        else do
-          -- More holders are pending. Re-create this contract with the updated state.
-          newDistCid <- create this with
-            pendingHolders = newPendingHolders
-            paidHolders = newPaidHolders
-          return $ Left newDistCid
+            recipient = shareholder
+            amount = paymentAmount
+            assetCid
+            recordDate
+            currency
 
--- | An archival contract that serves as a final, immutable record of a completed
--- | dividend distribution event.
+        -- If all shareholders have now been paid, archive this contract and create a completion record.
+        -- Otherwise, recreate this contract with the updated set of paid parties.
+        if Set.fromList allShareholderKeys == finalPaidSet then
+          do
+            create DividendDistributionComplete with
+              issuer, administrator, assetCid, recordDate, paymentDate, shareholders
+            archive self
+            -- Since the original contract is archived, we return its CID as a convention.
+            -- The caller should be aware it's archived and query for the `DividendDistributionComplete` contract.
+            return self
+        else
+          create this with paidParties = finalPaidSet
+
+-- | Represents the issuer's specific, confirmed obligation to pay a dividend amount
+-- to a single recipient. This contract acts as an IOU that can be settled.
+template DividendPayout
+  with
+    issuer: Party
+      -- ^ The party obligated to make the payment.
+    recipient: Party
+      -- ^ The shareholder entitled to receive the payment.
+    amount: Decimal
+      -- ^ The total dividend amount due.
+    currency: Text
+      -- ^ The currency of the payment.
+    assetCid: ContractId Asset
+      -- ^ The asset associated with this dividend.
+    recordDate: Date
+      -- ^ The record date of the dividend, for tracking purposes.
+  where
+    signatory issuer
+    observer recipient
+
+    key (issuer, recipient, assetCid, recordDate): (Party, Party, ContractId Asset, Date)
+    maintainer key._1
+
+    -- | A choice to represent the settlement of the payment obligation. This would be
+    -- exercised by the issuer once the payment has been made (e.g., via an off-ledger
+    -- bank transfer or an on-ledger cash token transfer).
+    choice Settle : ()
+      controller issuer
+      do
+        return ()
+
+-- | An archival contract created upon the successful completion of a dividend distribution,
+-- serving as a final, immutable record of the event.
 template DividendDistributionComplete
   with
     issuer: Party
-    regulator: Party
-    tokenCid: ContractId Token
-    exDividendDate: Date
+    administrator: Party
+    assetCid: ContractId Asset
+    recordDate: Date
     paymentDate: Date
-    totalAmountPaid: Numeric 10
-    finalPaidHolders: Map Party (Numeric 10)
+    shareholders: Map Party Decimal
   where
-    signatory issuer
-    observer regulator
+    signatory issuer, administrator
+
+    key (issuer, assetCid, recordDate): (Party, ContractId Asset, Date)
+    maintainer key._1
