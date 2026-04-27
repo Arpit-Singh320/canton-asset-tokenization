@@ -1,4 +1,4 @@
-sdk-version: 3.1.0
+sdk-version: 3.4.0
 name: canton-asset-tokenization
 version: 0.1.0
 source: daml
@@ -6,3 +6,11 @@ dependencies:
   - daml-prim
   - daml-stdlib
   - daml-script
+test-source: daml/test
+exposed-modules:
+  - Tokenization.Asset
+  - Tokenization.Token
+  - Tokenization.Roles
+  - Tokenization.Lifecycle
+  - Tokenization.Distribution
+  - Tokenization.CorporateAction
