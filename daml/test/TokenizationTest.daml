@@ -1,211 +1,241 @@
-module TokenizationTest where
+module Test.TokenizationTest where
 
 import Daml.Script
+import qualified DA.List as List
+import qualified DA.Set as Set
 
-import DA.Assert ((===), assert, assertMsg)
-import DA.Date (date, Month(..))
-import DA.Time (time)
-import DA.Either (isLeft)
-import DA.Optional (fromSomeNote)
-import DA.List (head)
+import Asset.Token
+import Asset.Role
+import Asset.Whitelist
+import Asset.Cash
+import Asset.Dividend
 
--- Project module imports
-import SecurityToken
-import Whitelist
-import Dividend
-import CorporateAction
+-- A record to hold parties for convenience in tests
+type Parties = {
+  issuer: Party,
+  investorA: Party,
+  investorB: Party,
+  unauthorized: Party,
+  regulator: Party,
+  custodian: Party
+}
 
--- | A full end-to-end test of the asset tokenization lifecycle.
--- This script covers:
--- 1. Whitelist creation and investor onboarding.
--- 2. Security token issuance.
--- 3. Primary distribution of tokens to whitelisted investors.
--- 4. A successful secondary transfer between two whitelisted investors.
--- 5. A failed secondary transfer attempt to a non-whitelisted party.
--- 6. Dividend declaration and distribution.
--- 7. A corporate action proposal and voting process.
-tokenizationLifecycleTests : Script ()
+-- Main test suite for the tokenization workflow
 tokenizationLifecycleTests = script do
-  -- === 0. SETUP: Allocate parties ===
-  issuer <- allocateParty "Issuer"
-  regulator <- allocateParty "Regulator"
-  alice <- allocateParty "Alice"
-  bob <- allocateParty "Bob"
-  charlie <- allocateParty "Charlie" -- Intentionally not whitelisted
 
-  debug "Parties allocated."
+  test "1. Asset Creation & Whitelisting" do
+    parties <- setupParties
+    -- Issuer creates the asset manager and corresponding whitelist
+    (managerCid, whitelistCid) <- setupAssetAndWhitelist parties
 
-  -- === 1. WHITELIST: Setup and Onboarding ===
-  debug "Setting up whitelist..."
-  whitelistProposalCid <- submit issuer do
-    createCmd WhitelistProposal with
-      issuer
-      regulator
+    -- Issuer adds Investor A and B to the whitelist
+    whitelistCid_1 <- submit parties.issuer do
+      exerciseCmd whitelistCid AddApprovedParty with partyToAdd = parties.investorA
+    whitelistCid_2 <- submit parties.issuer do
+      exerciseCmd whitelistCid_1 AddApprovedParty with partyToAdd = parties.investorB
 
-  whitelistCid <- submit regulator do
-    exerciseCmd whitelistProposalCid AcceptWhitelist
+    -- Verify parties are on the list
+    whitelist <- fromSomeNote "Whitelist contract not found" <$> queryContractId parties.issuer whitelistCid_2
+    assert $ Set.member parties.investorA whitelist.approvedParties
+    assert $ Set.member parties.investorB whitelist.approvedParties
 
-  debug $ "Whitelist created: " <> show whitelistCid
+    -- An unauthorized party cannot add anyone to the whitelist
+    submitMustFail parties.unauthorized do
+      exerciseCmd whitelistCid_2 AddApprovedParty with partyToAdd = parties.unauthorized
 
-  -- Onboard Alice and Bob
-  _ <- submit regulator do exerciseCmd whitelistCid AddToWhitelist with partyToAdd = alice
-  _ <- submit regulator do exerciseCmd whitelistCid AddToWhitelist with partyToAdd = bob
+    -- Issuer can remove a party from the whitelist
+    whitelistCid_3 <- submit parties.issuer do
+      exerciseCmd whitelistCid_2 RemoveApprovedParty with partyToRemove = parties.investorB
+    whitelist_final <- fromSomeNote "Whitelist contract not found after removal" <$> queryContractId parties.issuer whitelistCid_3
+    assert $ not $ Set.member parties.investorB whitelist_final.approvedParties
+    return ()
 
-  whitelistContract <- fetch whitelistCid
-  whitelistContract.approvedParties === [bob, alice] -- Note: order is LIFO
-  debug "Alice and Bob have been whitelisted."
+  test "2. Token Issuance" do
+    parties <- setupParties
+    (managerCid, whitelistCid) <- setupAssetAndWhitelist parties
+    -- Add Investor A to whitelist
+    whitelistCid' <- submit parties.issuer do exerciseCmd whitelistCid AddApprovedParty with partyToAdd = parties.investorA
 
-  -- === 2. TOKEN ISSUANCE: Create the Security Token ===
-  debug "Issuing security token..."
-  let
-    issueDate = date 2024 Jan 1
-    assetDescription = "Tokenized Real Estate Fund Series A"
-    totalQuantity = 10000.0
-    assetId = "TREF-SERIES-A"
+    -- Issuer issues 1000.0 tokens to Investor A
+    (holdingACid, newManagerCid) <- submit parties.issuer do
+      exerciseCmd managerCid Issue with
+        recipient = parties.investorA
+        quantity = 1000.0
+        whitelistCid = whitelistCid'
 
-  tokenCid <- submit issuer do
-    createCmd SecurityToken with
-      issuer
-      regulator
-      id = assetId
-      description = assetDescription
-      totalQuantity
-      issueDate
-      whitelistCid
+    -- Verify Investor A's holding and the new total supply
+    holdingA <- fromSomeNote "HoldingA not found" <$> queryContractId parties.investorA holdingACid
+    holdingA.quantity === 1000.0
+    holdingA.asset.id.symbol === "TREF"
 
-  debug $ "SecurityToken created: " <> show tokenCid
+    manager <- fromSomeNote "Manager not found" <$> queryContractId parties.issuer newManagerCid
+    manager.totalSupply === 1000.0
 
-  -- === 3. PRIMARY DISTRIBUTION: Mint and Distribute Tokens ===
-  debug "Distributing tokens to initial investors..."
-  (aliceHoldingCid, bobHoldingCid) <- submit issuer do
-    (,)
-      <$> exerciseCmd tokenCid MintAndDistribute with recipient = alice, quantity = 7500.0
-      <*> exerciseCmd tokenCid MintAndDistribute with recipient = bob, quantity = 2500.0
+    -- Issuing to a non-whitelisted party must fail
+    submitMustFail parties.issuer do
+      exerciseCmd newManagerCid Issue with
+        recipient = parties.unauthorized
+        quantity = 500.0
+        whitelistCid = whitelistCid'
+    return ()
 
-  -- Verify initial holdings
-  aliceHolding <- fetch aliceHoldingCid
-  aliceHolding.owner === alice
-  aliceHolding.quantity === 7500.0
+  test "3. Token Transfer" do
+    parties <- setupParties
+    (managerCid, whitelistCid) <- setupAssetAndWhitelist parties
+    whitelistCid' <- submit parties.issuer do exerciseCmd whitelistCid AddApprovedParty with partyToAdd = parties.investorA
+    whitelistCid'' <- submit parties.issuer do exerciseCmd whitelistCid' AddApprovedParty with partyToAdd = parties.investorB
 
-  bobHolding <- fetch bobHoldingCid
-  bobHolding.owner === bob
-  bobHolding.quantity === 2500.0
-  debug "Initial token distribution complete. Alice has 7500, Bob has 2500."
+    (holdingACid, managerCid1) <- submit parties.issuer do
+      exerciseCmd managerCid Issue with recipient = parties.investorA, quantity = 1000.0, whitelistCid = whitelistCid''
 
-  -- === 4. SECONDARY TRANSFER: Successful Transfer ===
-  debug "Testing successful secondary transfer from Alice to Bob..."
-  -- Alice transfers 1000 units to Bob
-  transferProposalCid <- submit alice do
-    exerciseCmd aliceHoldingCid ProposeTransfer with
-      newOwner = bob
-      transferQuantity = 1000.0
+    -- Investor A proposes to transfer 250.0 tokens to Investor B
+    proposalCid <- submit parties.investorA do
+      exerciseCmd holdingACid ProposeTransfer with newOwner = parties.investorB, quantity = 250.0
 
-  (newAliceHoldingCid, newBobHoldingCid) <- submit bob do
-    exerciseCmd transferProposalCid AcceptTransfer
+    -- Investor B accepts the transfer
+    (newHoldingACid, holdingBCid) <- submit parties.investorB do
+      exerciseCmd proposalCid AcceptTransfer with whitelistCid = whitelistCid''
 
-  -- Verify new holding balances
-  newAliceHolding <- fetch newAliceHoldingCid
-  newAliceHolding.quantity === 6500.0 -- 7500 - 1000
+    -- Verify the final balances are correct
+    newHoldingA <- fromSomeNote "New HoldingA not found" <$> queryContractId parties.investorA newHoldingACid
+    newHoldingA.quantity === 750.0
 
-  newBobHolding <- fetch newBobHoldingCid
-  newBobHolding.quantity === 3500.0 -- 2500 + 1000
-  debug "Transfer successful. Alice now has 6500, Bob has 3500."
+    holdingB <- fromSomeNote "HoldingB not found" <$> queryContractId parties.investorB holdingBCid
+    holdingB.quantity === 250.0
 
-  -- === 5. SECONDARY TRANSFER: Failed Transfer (Not Whitelisted) ===
-  debug "Testing failed transfer to non-whitelisted party Charlie..."
-  transferToCharlieRes <- submitTry bob do
-    exerciseCmd newBobHoldingCid ProposeTransfer with
-      newOwner = charlie
-      transferQuantity = 500.0
+    -- Attempt to transfer to a non-whitelisted party must fail
+    submitMustFail do
+      proposalCid2 <- submit parties.investorA do
+        exerciseCmd newHoldingACid ProposeTransfer with newOwner = parties.unauthorized, quantity = 100.0
+      submit parties.unauthorized do
+        exerciseCmd proposalCid2 AcceptTransfer with whitelistCid = whitelistCid''
 
-  assert (isLeft transferToCharlieRes)
-  debug "Transfer attempt to Charlie correctly failed as he is not whitelisted."
+    -- Attempt to transfer more tokens than owned must fail
+    submitMustFail do
+      submit parties.investorA do
+        exerciseCmd newHoldingACid ProposeTransfer with newOwner = parties.investorB, quantity = 800.0
+    return ()
 
+  test "4. Dividend Distribution" do
+    parties <- setupParties
+    (managerCid, whitelistCid) <- setupAssetAndWhitelist parties
+    whitelistCid1 <- submit parties.issuer do exerciseCmd whitelistCid AddApprovedParty with partyToAdd = parties.investorA
+    whitelistCid2 <- submit parties.issuer do exerciseCmd whitelistCid1 AddApprovedParty with partyToAdd = parties.investorB
 
-  -- === 6. DIVIDEND: Declare and Distribute ===
-  debug "Testing dividend distribution..."
-  let
-    recordDate = date 2024 Mar 15
-    paymentDate = date 2024 Apr 1
-    dividendPerShare = 0.10 -- $0.10 per token
+    -- Issue tokens: 750 to A, 250 to B
+    (holdingACid, managerCid1) <- submit parties.issuer do exerciseCmd managerCid Issue with recipient = parties.investorA, quantity = 750.0, whitelistCid = whitelistCid2
+    (holdingBCid, managerCid2) <- submit parties.issuer do exerciseCmd managerCid1 Issue with recipient = parties.investorB, quantity = 250.0, whitelistCid = whitelistCid2
 
-  -- Issuer proposes the dividend
-  dividendProposalCid <- submit issuer do
-    exerciseCmd tokenCid ProposeDividend with
-      recordDate
-      paymentDate
-      dividendPerShare
+    -- Issuer sets up a dividend distribution of $500 total ($0.50 per share)
+    let dividendAmount = 500.0
+    let perShareRate = dividendAmount / 1000.0
 
-  -- Issuer distributes the dividend payments
-  -- The DistributeDividend choice will discover all TokenHolding contracts and create payments
-  (alicePaymentCid, bobPaymentCid) <- submit issuer do
-    exerciseCmd dividendProposalCid DistributeDividend
+    -- Issuer needs cash to pay the dividends
+    cashIssuerCid <- submit parties.issuer do createCmd CashIssuer with issuer = parties.issuer
+    cashHoldingCid <- submit parties.issuer do exerciseCmd cashIssuerCid IssueCash with owner = parties.issuer, amount = dividendAmount
 
-  -- Verify dividend payments
-  alicePayment <- fetch alicePaymentCid
-  alicePayment.investor === alice
-  alicePayment.paymentAmount === 650.0 -- 6500 * 0.10
+    -- Issuer creates the distribution contract, funding it with the cash holding
+    distributionCid <- submit parties.issuer do
+      createCmd DividendDistribution with
+        issuer = parties.issuer
+        managerCid = managerCid2
+        perShareRate = perShareRate
+        paymentCid = cashHoldingCid
+        claimedOwners = Set.empty
 
-  bobPayment <- fetch bobPaymentCid
-  bobPayment.investor === bob
-  bobPayment.paymentAmount === 350.0 -- 3500 * 0.10
-  debug "Dividend distribution successful."
+    -- Investor A claims their dividend (750 * 0.5 = $375)
+    (newDistributionCid, investorACashCid) <- submitMulti [parties.investorA, parties.issuer] [] do
+      exerciseCmd distributionCid ClaimDividend with holdingCid = holdingACid
 
+    -- Verify Investor A's cash and that the distribution state is updated
+    investorACash <- fromSomeNote "Investor A cash not found" <$> queryContractId parties.investorA investorACashCid
+    investorACash.amount === 375.0
+    newDistribution <- fromSomeNote "Distribution contract not found" <$> queryContractId parties.issuer newDistributionCid
+    assert $ Set.member parties.investorA newDistribution.claimedOwners
 
-  -- === 7. CORPORATE ACTION: Propose and Vote ===
-  debug "Testing corporate action: a board member vote..."
-  let
-    actionDetails = "Vote on appointing new board member 'Daniel Larimer'"
-    votingDeadline = time (date 2024 May 1) 0 0 0
+    -- Investor B claims their dividend (250 * 0.5 = $125)
+    (finalDistributionCid, investorBCashCid) <- submitMulti [parties.investorB, parties.issuer] [] do
+      exerciseCmd newDistributionCid ClaimDividend with holdingCid = holdingBCid
 
-  -- Issuer proposes the action
-  actionProposalCid <- submit issuer do
-    createCmd CorporateActionProposal with
-      issuer
-      tokenCid
-      details = actionDetails
-      votingDeadline
+    -- Verify Investor B's cash
+    investorBCash <- fromSomeNote "Investor B cash not found" <$> queryContractId parties.investorB investorBCashCid
+    investorBCash.amount === 125.0
 
-  -- Holders cast their votes.
-  -- Alice votes in favor (True)
-  _ <- submit alice do
-    exerciseCmd actionProposalCid CastVote with vote = True
+    -- Attempting to claim twice must fail
+    submitMustFail do
+      submitMulti [parties.investorA, parties.issuer] [] do
+        exerciseCmd finalDistributionCid ClaimDividend with holdingCid = holdingACid
+    return ()
 
-  -- Bob votes against (False)
-  _ <- submit bob do
-    exerciseCmd actionProposalCid CastVote with vote = False
+  test "5. Token Redemption" do
+    parties <- setupParties
+    (managerCid, whitelistCid) <- setupAssetAndWhitelist parties
+    whitelistCid' <- submit parties.issuer do exerciseCmd whitelistCid AddApprovedParty with partyToAdd = parties.investorA
 
-  -- Verify votes were cast
-  actionProposal <- fetch actionProposalCid
-  actionProposal.votesCast === [bob, alice]
-  -- In a real scenario, weights would be attached. This test verifies participation.
-  debug "Alice and Bob have cast their votes on the corporate action."
+    (holdingACid, managerCid1) <- submit parties.issuer do
+      exerciseCmd managerCid Issue with recipient = parties.investorA, quantity = 1000.0, whitelistCid = whitelistCid'
 
-  -- Issuer processes the result.
-  -- Let's say based on a 2/3 majority weighted by holdings, the action passes.
-  actionResultCid <- submit issuer do
-    exerciseCmd actionProposalCid ProcessVoteResult with passed = True
+    let redemptionAmount = 200.0
+    let redemptionPrice = 10.50
+    let totalPayment = redemptionAmount * redemptionPrice
 
-  actionResult <- fetch actionResultCid
-  actionResult.details === actionDetails
-  actionResult.passed === True
-  debug "Corporate action vote processed and result recorded."
+    -- Issuer needs cash to pay for the redemption
+    cashIssuerCid <- submit parties.issuer do createCmd CashIssuer with issuer = parties.issuer
+    issuerCashCid <- submit parties.issuer do exerciseCmd cashIssuerCid IssueCash with owner = parties.issuer, amount = totalPayment
 
+    -- Investor A requests redemption; issuer co-signs to provide cash
+    (remainingHoldingCid, _investorCashCid, finalManagerCid) <-
+      submitMulti [parties.investorA, parties.issuer] [] do
+        exerciseCmd holdingACid RequestRedemption with
+          quantity = redemptionAmount
+          managerCid = managerCid1
+          cashToPayCid = issuerCashCid
 
-  -- === 8. FINAL STATE VALIDATION ===
-  debug "Performing final state validation..."
-  -- Query for active holdings
-  aliceHoldings <- query @TokenHolding alice
-  (aliceCid, aliceContract) <- return $ fromSomeNote "Alice holding not found" $ head aliceHoldings
-  aliceContract.quantity === 6500.0
+    -- Verify Investor A's new token balance
+    remainingHolding <- fromSomeNote "Remaining holding not found" <$> queryContractId parties.investorA remainingHoldingCid
+    remainingHolding.quantity === 800.0
 
-  bobHoldings <- query @TokenHolding bob
-  (bobCid, bobContract) <- return $ fromSomeNote "Bob holding not found" $ head bobHoldings
-  bobContract.quantity === 3500.0
+    -- Verify total supply is reduced on the manager contract
+    finalManager <- fromSomeNote "Final manager not found" <$> queryContractId parties.issuer finalManagerCid
+    finalManager.totalSupply === 800.0
 
-  -- Ensure charlie has no holdings
-  charlieHoldings <- query @TokenHolding charlie
-  length charlieHoldings === 0
+    -- Verify issuer's cash holding was consumed
+    queryContractId parties.issuer issuerCashCid >>= \c -> c === None
+    return ()
 
-  debug "Final state of token holdings is correct."
-  debug "Tokenization lifecycle test completed successfully."
+-- Helper function to allocate all necessary parties for the tests
+setupParties : Script Parties
+setupParties = do
+  issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "Issuer_TokenizationTest")
+  investorA <- allocatePartyWithHint "InvestorA" (PartyIdHint "InvestorA_TokenizationTest")
+  investorB <- allocatePartyWithHint "InvestorB" (PartyIdHint "InvestorB_TokenizationTest")
+  unauthorized <- allocatePartyWithHint "Unauthorized" (PartyIdHint "Unauthorized_TokenizationTest")
+  regulator <- allocatePartyWithHint "Regulator" (PartyIdHint "Regulator_TokenizationTest")
+  custodian <- allocatePartyWithHint "Custodian" (PartyIdHint "Custodian_TokenizationTest")
+  return Parties with ..
+
+-- Helper function to create the asset manager and whitelist contracts
+setupAssetAndWhitelist : Parties -> Script (ContractId Manager, ContractId Whitelist)
+setupAssetAndWhitelist parties = do
+  let asset = AssetId with
+        symbol = "TREF"
+        issuer = parties.issuer
+  managerCid <- submit parties.issuer do
+    createCmd Manager with
+      asset
+      description = "Tokenized Real Estate Fund"
+      custodian = parties.custodian
+      regulator = parties.regulator
+      totalSupply = 0.0
+      observers = []
+  whitelistCid <- submit parties.issuer do
+    createCmd Whitelist with
+      issuer = parties.issuer
+      regulator = parties.regulator
+      managerCid
+      approvedParties = Set.empty
+  return (managerCid, whitelistCid)
+
+-- Helper for concise equality assertions
+(===) : (Show a, Eq a) => a -> a -> Script ()
+x === y = assertMsg ("Expected " <> show y <> ", but got " <> show x) (x == y)
