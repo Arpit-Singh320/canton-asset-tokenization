@@ -1,234 +1,321 @@
-// Copyright (c) 2024 Digital Asset (Canton) Daemon LLC and/or its affiliates. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+import { CreateCommand, ExerciseCommand } from '@c7/ledger';
 
-import { CreateCommand, ExerciseCommand } from '@daml/ledger';
+// =================================================================================================
+// Constants & Configuration
+// =================================================================================================
 
-// --- Configuration ---
-const LEDGER_URL = process.env.REACT_APP_LEDGER_URL || 'http://localhost:7575';
-let authToken: string | null = null;
+const LEDGER_URL = 'http://localhost:7575'; // Default for dpm sandbox
 
-// --- Type Definitions ---
-// These types should mirror the Daml templates they represent.
+// Template IDs - assuming a Daml module structure like `Rwa.Asset`, `Rwa.Instrument`, etc.
+const TEMPLATE_IDS = {
+  Instrument: "Rwa.Instrument:Instrument",
+  Asset: "Rwa.Asset:Asset",
+  TransferProposal: "Rwa.Asset:TransferProposal",
+  Whitelist: "Rwa.Whitelist:Whitelist",
+  DistributionProposal: "Rwa.Distribution:DistributionProposal",
+  Dividend: "Rwa.Distribution:Dividend",
+};
 
-/** Represents a generic active contract from the JSON API. */
-export interface Contract<T> {
+// =================================================================================================
+// Type Definitions
+// =================================================================================================
+
+/**
+ * Represents the connection context for interacting with the Canton ledger.
+ */
+export interface LedgerContext {
+  token: string;
+  party: string;
+}
+
+/**
+ * Represents an active contract on the ledger, as returned by the JSON API.
+ */
+export interface ActiveContract<T> {
   contractId: string;
   templateId: string;
   payload: T;
 }
 
-/** Payload for the Token:AssetToken template. */
-export interface AssetToken {
-  issuer: string;
-  owner: string;
-  assetId: string;
+// Daml Type Aliases for clarity
+type Party = string;
+type ContractId<T> = string;
+type Decimal = string; // Daml Decimals are represented as strings in JSON API
+type Date = string;    // Daml Dates (YYYY-MM-DD) are strings in JSON API
+
+// Payload types for key templates
+export interface Instrument {
+  issuer: Party;
+  id: string;
   description: string;
-  quantity: string; // Daml Decimal is a string in JSON
-  observers: string[];
+  assetType: string;
+  quantity: Decimal;
+  whitelist: ContractId<Whitelist>;
+  observers: Party[];
 }
 
-/** Payload for the Token:TokenIssuanceProposal template. */
-export interface TokenIssuanceProposal {
-  issuer: string;
-  newOwner: string;
-  assetId: string;
-  description: string;
-  quantity: string;
+export interface Asset {
+  instrument: Instrument;
+  owner: Party;
+  quantity: Decimal;
 }
 
-/** Payload for the Token:TransferProposal template. */
 export interface TransferProposal {
-  tokenCid: string; // Daml ContractId is a string in JSON
-  currentOwner: string;
-  newOwner:string;
-  quantity: string;
+  asset: Asset;
+  newOwner: Party;
 }
 
-// --- Template Name Helpers ---
-// Using a central object for template names avoids typos and makes refactoring easier.
-const T = {
-    AssetToken: `Token:AssetToken`,
-    TokenIssuanceProposal: `Token:TokenIssuanceProposal`,
-    TransferProposal: `Token:TransferProposal`,
-};
+export interface Whitelist {
+  issuer: Party;
+  instrumentId: string;
+  allowedParties: Party[];
+}
 
-// --- Service Setup ---
+export interface DistributionProposal {
+    issuer: Party;
+    instrument: Instrument;
+    exDate: Date;
+    payDate: Date;
+    amountPerShare: Decimal;
+}
+
+export interface Dividend {
+    owner: Party;
+    instrument: Instrument;
+    payDate: Date;
+    amount: Decimal;
+}
+
+
+// =================================================================================================
+// Private Helper Functions
+// =================================================================================================
 
 /**
- * Sets the authorization token for all subsequent ledger API calls.
- * This should be called once after the user logs in.
- * @param {string} token - The JWT token provided by the authentication service.
+ * Executes a generic, authenticated POST request to the JSON API.
+ * @param endpoint The API endpoint (e.g., '/v1/query').
+ * @param token The JWT for authorization.
+ * @param body The request body.
+ * @returns The JSON response from the API.
  */
-export const setToken = (token: string): void => {
-  authToken = token;
-};
-
-/**
- * A helper function to make authenticated requests to the Canton JSON API.
- * @param {string} endpoint - The API endpoint (e.g., '/v1/query').
- * @param {object} body - The request body.
- * @returns {Promise<any>} The JSON response from the API.
- */
-const apiFetch = async (endpoint: string, body: object): Promise<any> => {
-  if (!authToken) {
-    throw new Error('Authentication token not set. Please call setToken() first.');
-  }
-
-  const response = await fetch(`${LEDGER_URL}${endpoint}`, {
+async function post<T>(endpoint: string, token: string, body: object): Promise<T> {
+  const url = `${LEDGER_URL}${endpoint}`;
+  const response = await fetch(url, {
     method: 'POST',
     headers: {
+      'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${authToken}`,
     },
     body: JSON.stringify(body),
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    console.error('API Request Failed:', errorText);
-    throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+    const errorBody = await response.text();
+    console.error(`API request failed [${response.status} ${response.statusText}] to ${url}:`, errorBody);
+    throw new Error(`Request failed: ${response.statusText}`);
   }
 
-  const result = await response.json();
-
-  if (result.status !== 200) {
-    console.error('Ledger Operation Failed:', result.errors);
-    throw new Error(`Ledger operation failed: ${JSON.stringify(result.errors)}`);
+  const json = await response.json();
+  if (json.status !== 200) {
+    console.error(`API returned non-200 status in body:`, json);
+    throw new Error(`API Error: ${JSON.stringify(json.errors)}`);
   }
 
-  return result.result;
-};
-
-// --- Ledger Interaction Functions ---
+  return json.result as T;
+}
 
 /**
- * Fetches all AssetToken contracts for the currently authenticated party.
- * @param {string} party - The party identifier of the token owner.
- * @returns {Promise<Contract<AssetToken>[]>} A list of active AssetToken contracts.
+ * Queries the ledger for active contracts based on a template ID.
+ * @param context The ledger context.
+ * @param templateId The full template ID to query for.
+ * @returns A promise that resolves to an array of active contracts.
  */
-export const queryTokens = async (party: string): Promise<Contract<AssetToken>[]> => {
-  return apiFetch('/v1/query', {
-    templateIds: [T.AssetToken],
-    query: { owner: party },
-  });
-};
+async function query<T>(context: LedgerContext, templateId: string): Promise<ActiveContract<T>[]> {
+  return post<ActiveContract<T>[]>('/v1/query', context.token, { templateIds: [templateId] });
+}
 
 /**
- * Fetches pending token issuance proposals for the currently authenticated party.
- * @param {string} party - The party identifier of the prospective new owner.
- * @returns {Promise<Contract<TokenIssuanceProposal>[]>} A list of active proposals.
+ * Submits a command to create a new contract.
+ * @param context The ledger context.
+ * @param command The create command payload.
+ * @returns The result of the create command.
  */
-export const queryIssuanceProposals = async (party: string): Promise<Contract<TokenIssuanceProposal>[]> => {
-  return apiFetch('/v1/query', {
-    templateIds: [T.TokenIssuanceProposal],
-    query: { newOwner: party },
-  });
-};
+async function create(context: LedgerContext, command: CreateCommand) {
+  return post('/v1/create', context.token, command);
+}
 
 /**
- * Fetches pending token transfer proposals for the currently authenticated party.
- * @param {string} party - The party identifier of the prospective new owner.
- * @returns {Promise<Contract<TransferProposal>[]>} A list of active proposals.
+ * Submits a command to exercise a choice on an existing contract.
+ * @param context The ledger context.
+ * @param command The exercise command payload.
+ * @returns The result of the exercise command, typically including the created contract.
  */
-export const queryTransferProposals = async (party: string): Promise<Contract<TransferProposal>[]> => {
-  return apiFetch('/v1/query', {
-    templateIds: [T.TransferProposal],
-    query: { newOwner: party },
-  });
-};
+async function exercise(context: LedgerContext, command: ExerciseCommand) {
+  return post('/v1/exercise', context.token, command);
+}
+
+// =================================================================================================
+// Public Service API
+// =================================================================================================
 
 /**
- * Creates a proposal to issue a new asset token.
- * @param {object} proposal - The details of the token to be issued.
- * @returns {Promise<any>} The result of the create command.
+ * Fetches all token instruments visible to the current party.
  */
-export const proposeIssuance = async (proposal: Omit<TokenIssuanceProposal, "issuer">): Promise<any> => {
-  const command: CreateCommand<TokenIssuanceProposal> = {
-    templateId: T.TokenIssuanceProposal,
-    payload: {
-      ...proposal,
-      // Issuer is implicitly the party making the request, but we need to specify it in the payload.
-      // In a real app, you'd get this from the user's session/token.
-      issuer: proposal.newOwner, // This is a simplification; typically issuer is a separate entity.
-    }
-  };
-  return apiFetch('/v1/create', command);
-};
+export const getInstruments = (context: LedgerContext): Promise<ActiveContract<Instrument>[]> =>
+  query<Instrument>(context, TEMPLATE_IDS.Instrument);
 
 /**
- * Accepts a token issuance proposal.
- * @param {string} proposalCid - The contract ID of the TokenIssuanceProposal.
- * @returns {Promise<any>} The result of exercising the 'Accept' choice.
+ * Fetches all asset holdings for the current party.
  */
-export const acceptIssuance = async (proposalCid: string): Promise<any> => {
-  const command: ExerciseCommand = {
-    templateId: T.TokenIssuanceProposal,
-    contractId: proposalCid,
-    choice: 'Accept',
-    argument: {},
-  };
-  return apiFetch('/v1/exercise', command);
-};
+export const getHoldings = (context: LedgerContext): Promise<ActiveContract<Asset>[]> =>
+  query<Asset>(context, TEMPLATE_IDS.Asset);
 
 /**
- * Proposes to transfer a quantity of an asset token to a new owner.
- * @param {string} tokenCid - The contract ID of the AssetToken to transfer from.
- * @param {string} newOwner - The party to receive the tokens.
- * @param {string} quantity - The quantity of tokens to transfer.
- * @returns {Promise<any>} The result of exercising the 'Propose_Transfer' choice.
+ * Fetches all pending inbound transfer proposals for the current party.
  */
-export const proposeTransfer = async (tokenCid: string, newOwner: string, quantity: string): Promise<any> => {
-  const command: ExerciseCommand = {
-    templateId: T.AssetToken,
-    contractId: tokenCid,
+export const getInboundTransferProposals = (context: LedgerContext): Promise<ActiveContract<TransferProposal>[]> =>
+  query<TransferProposal>(context, TEMPLATE_IDS.TransferProposal);
+
+
+/**
+ * Fetches all dividends payable to the current party.
+ */
+export const getDividends = (context: LedgerContext): Promise<ActiveContract<Dividend>[]> =>
+    query<Dividend>(context, TEMPLATE_IDS.Dividend);
+
+
+/**
+ * Proposes to transfer a quantity of an asset to a new owner.
+ * @param context The ledger context.
+ * @param assetCid The ContractId of the Asset holding to transfer from.
+ * @param newOwner The Party to transfer the asset to.
+ * @param quantity The amount of the asset to transfer.
+ */
+export const proposeTransfer = (
+  context: LedgerContext,
+  assetCid: ContractId<Asset>,
+  newOwner: Party,
+  quantity: Decimal
+) => {
+  const exerciseCommand: ExerciseCommand = {
+    templateId: TEMPLATE_IDS.Asset,
+    contractId: assetCid,
     choice: 'Propose_Transfer',
-    argument: { newOwner, quantity },
+    argument: {
+      newOwner,
+      quantity,
+    },
   };
-  return apiFetch('/v1/exercise', command);
+  return exercise(context, exerciseCommand);
 };
 
 /**
- * Accepts a token transfer proposal.
- * @param {string} proposalCid - The contract ID of the TransferProposal.
- * @returns {Promise<any>} The result of exercising the 'Accept' choice.
+ * Accepts a pending asset transfer proposal.
+ * @param context The ledger context.
+ * @param proposalCid The ContractId of the TransferProposal to accept.
  */
-export const acceptTransfer = async (proposalCid: string): Promise<any> => {
-  const command: ExerciseCommand = {
-    templateId: T.TransferProposal,
+export const acceptTransfer = (context: LedgerContext, proposalCid: ContractId<TransferProposal>) => {
+  const exerciseCommand: ExerciseCommand = {
+    templateId: TEMPLATE_IDS.TransferProposal,
     contractId: proposalCid,
-    choice: 'Accept',
+    choice: 'Accept_Transfer',
     argument: {},
   };
-  return apiFetch('/v1/exercise', command);
+  return exercise(context, exerciseCommand);
 };
 
 /**
- * Rejects a token transfer proposal.
- * @param {string} proposalCid - The contract ID of the TransferProposal.
- * @returns {Promise<any>} The result of exercising the 'Reject' choice.
+ * Claims a pending dividend payment.
+ * @param context The ledger context.
+ * @param dividendCid The ContractId of the Dividend to claim.
  */
-export const rejectTransfer = async (proposalCid: string): Promise<any> => {
-    const command: ExerciseCommand = {
-        templateId: T.TransferProposal,
-        contractId: proposalCid,
-        choice: 'Reject',
-        argument: {}
+export const claimDividend = (context: LedgerContext, dividendCid: ContractId<Dividend>) => {
+    const exerciseCommand: ExerciseCommand = {
+      templateId: TEMPLATE_IDS.Dividend,
+      contractId: dividendCid,
+      choice: 'Claim',
+      argument: {},
     };
-    return apiFetch('/v1/exercise', command);
+    return exercise(context, exerciseCommand);
+};
+
+
+// =================================================================================================
+// Issuer / Admin specific functions
+// =================================================================================================
+
+
+/**
+ * Issues a new asset to a specified owner. (Issuer only)
+ * @param context The ledger context (must be the issuer).
+ * @param instrumentCid The ContractId of the Instrument to issue against.
+ * @param owner The party who will own the new asset.
+ * @param quantity The quantity of the asset to issue.
+ */
+export const issueAsset = (
+    context: LedgerContext,
+    instrumentCid: ContractId<Instrument>,
+    owner: Party,
+    quantity: Decimal
+) => {
+    const exerciseCommand: ExerciseCommand = {
+        templateId: TEMPLATE_IDS.Instrument,
+        contractId: instrumentCid,
+        choice: 'Issue',
+        argument: {
+            owner,
+            quantity
+        }
+    };
+    return exercise(context, exerciseCommand);
 };
 
 /**
- * Redeem (burn) a quantity of an asset token.
- * @param {string} tokenCid - The contract ID of the AssetToken to redeem.
- * @param {string} quantity - The quantity to redeem.
- * @returns {Promise<any>} The result of exercising the 'Redeem' choice.
+ * Adds a party to an instrument's whitelist. (Issuer only)
+ * @param context The ledger context (must be the issuer).
+ * @param whitelistCid The ContractId of the Whitelist contract.
+ * @param partyToAdd The party to add to the allowed list.
  */
-export const redeemToken = async (tokenCid: string, quantity: string): Promise<any> => {
-    const command: ExerciseCommand = {
-        templateId: T.AssetToken,
-        contractId: tokenCid,
-        choice: 'Redeem',
-        argument: { quantity },
+export const addToWhitelist = (
+    context: LedgerContext,
+    whitelistCid: ContractId<Whitelist>,
+    partyToAdd: Party
+) => {
+    const exerciseCommand: ExerciseCommand = {
+        templateId: TEMPLATE_IDS.Whitelist,
+        contractId: whitelistCid,
+        choice: 'AddParty',
+        argument: {
+            partyToAdd
+        }
     };
-    return apiFetch('/v1/exercise', command);
-};
+    return exercise(context, exerciseCommand);
+}
+
+/**
+ * Proposes a new dividend distribution for an instrument. (Issuer only)
+ * @param context The ledger context (must be the issuer).
+ * @param instrumentCid The ContractId of the Instrument to distribute dividends for.
+ * @param exDate The ex-dividend date.
+ * @param payDate The payment date.
+ * @param amountPerShare The cash amount to be paid per share/unit.
+ */
+export const proposeDistribution = (
+    context: LedgerContext,
+    instrumentCid: ContractId<Instrument>,
+    exDate: Date,
+    payDate: Date,
+    amountPerShare: Decimal
+) => {
+    const exerciseCommand: ExerciseCommand = {
+        templateId: TEMPLATE_IDS.Instrument,
+        contractId: instrumentCid,
+        choice: 'Propose_Distribution',
+        argument: {
+            exDate,
+            payDate,
+            amountPerShare
+        }
+    };
+    return exercise(context, exerciseCommand);
+}
